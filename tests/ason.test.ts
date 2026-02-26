@@ -300,3 +300,68 @@ describe('large-scale', () => {
     expect(decoded[999]).toEqual(rows[999]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 11. Format validation: {schema}: vs [{schema}]:
+//   - [{schema}]: (r1),(r2),(r3)  ✔ correct (array, multiple)
+//   - {schema}: (r1)             ✔ correct (single struct, one tuple)
+//   - [{schema}]: (r1)           ✔ correct (array, single element)
+//   - {schema}: (r1),(r2),(r3)   ✘ wrong  (single struct schema, multiple tuples)
+// ---------------------------------------------------------------------------
+
+describe('format validation', () => {
+  const BAD_FMT  = '{id:int, name:str}:\n  (1, Alice),\n  (2, Bob),\n  (3, Carol)';
+  const GOOD_FMT = '[{id:int, name:str}]:\n  (1, Alice),\n  (2, Bob),\n  (3, Carol)';
+
+  // Scenario 4 (incorrect): single struct schema with multiple tuples
+  it('rejects {schema}: with multiple tuples decoded as array', () => {
+    expect(() => decode(BAD_FMT) as unknown[]).toThrow(AsonError);
+  });
+
+  it('rejects {schema}: with two tuples for single struct decode', () => {
+    const bad = '{id:int,name:str}:(10,Dave),(11,Eve)';
+    expect(() => decode(bad)).toThrow(AsonError);
+  });
+
+  it('rejects {schema}: without [] wrapper for array inputs', () => {
+    const bad = '{id,name}:(1,A),(2,B),(3,C),(4,D),(5,E)';
+    expect(() => decode(bad)).toThrow(AsonError);
+  });
+
+  // Scenario 1 (correct): array schema with multiple tuples
+  it('accepts [{schema}]: with multiple tuples', () => {
+    const result = decode(GOOD_FMT) as { id: number; name: string }[];
+    expect(result).toHaveLength(3);
+    expect(result[0]).toEqual({ id: 1, name: 'Alice' });
+    expect(result[2]).toEqual({ id: 3, name: 'Carol' });
+  });
+
+  // Scenario 2 (correct): single struct schema with one tuple
+  it('accepts {schema}: with exactly one tuple', () => {
+    const result = decode('{id:int, name:str}:(1,Alice)') as { id: number; name: string };
+    expect(result).toEqual({ id: 1, name: 'Alice' });
+  });
+
+  // Scenario 3 (correct): array schema with single element
+  it('accepts [{schema}]: with single tuple', () => {
+    const result = decode('[{id:int, name:str}]:(1,Alice)') as { id: number; name: string }[];
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual({ id: 1, name: 'Alice' });
+  });
+
+  // Roundtrip encode -> decode consistency
+  it('encode/decode roundtrip for single struct matches scenario 2', () => {
+    const obj = { id: 42, name: 'Bob' };
+    const text = encode(obj, '{id:int, name:str}');
+    expect(text).toMatch(/^\{id:int, name:str\}:/);
+    expect(decode(text)).toEqual(obj);
+  });
+
+  it('encode/decode roundtrip for single-element array matches scenario 3', () => {
+    const rows = [{ id: 7, name: 'Carol' }];
+    const text = encode(rows, '[{id:int, name:str}]');
+    expect(text).toMatch(/^\[\{id:int, name:str\}\]:/);
+    const decoded = decode(text) as typeof rows;
+    expect(decoded).toEqual(rows);
+  });
+});
