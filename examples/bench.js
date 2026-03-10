@@ -1,10 +1,17 @@
 /**
- * ason-js — benchmark vs JSON.parse / JSON.stringify
+ * ason-js — benchmark vs JSON.parse / JSON.stringify (inference-driven API)
  * Run: node examples/bench.js  (after npm run build)
+ *
+ * Benchmark semantics:
+ *   "ASON untyped serialize"  → encode(obj)        — no schema arg; shorter output
+ *   "ASON typed serialize"    → encodeTyped(obj)   — typed header; decode restores types
+ *   "ASON deserialize"        → decode(text)        — reads embedded schema
+ *   "BIN serialize"           → encodeBinary(obj)  — schema inferred internally
+ *   "BIN deserialize"         → decodeBinary(data, schema) — schema required
  *
  * Mirrors ason-go/examples/bench and ason-py/examples/bench.
  */
-import { encode, decode, encodeBinary, decodeBinary } from '../dist/index.js';
+import { encode, encodeTyped, decode, encodeBinary, decodeBinary } from '../dist/index.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -25,7 +32,7 @@ function fmtNs(ns) {
 }
 
 function printRow(label, ns, extra = '') {
-  console.log(`  ${label.padEnd(30)} ${fmtNs(ns).padStart(12)}  ${extra}`);
+  console.log(`  ${label.padEnd(32)} ${fmtNs(ns).padStart(12)}  ${extra}`);
 }
 
 function makeUsers(n) {
@@ -53,32 +60,39 @@ function makeAllTypes(n) {
   }));
 }
 
-const FLAT_SCHEMA = '[{id:int, name:str, email:str, score:float, active:bool, dept:str, age:int, salary:int}]';
-const ALL_SCHEMA  = '[{b:bool, n:int, u:uint, f:float, s:str, on:int?, of:float?}]';
+// Schema strings used only for decodeBinary (binary decode requires explicit schema)
+const FLAT_SCHEMA_BIN = '[{id:int, name:str, email:str, score:float, active:bool, dept:str, age:int, salary:int}]';
+const ALL_SCHEMA_BIN  = '[{b:bool, n:int, u:uint, f:float, s:str, on:int?, of:float?}]';
 
 // ---------------------------------------------------------------------------
-// Section 1: Flat struct (8 fields) — various sizes
+// Section 1: Flat struct (8 fields) — untyped vs typed vs JSON serialize
 // ---------------------------------------------------------------------------
-console.log('\n=== Section 1: Flat struct (8 fields) ===\n');
-console.log('  ' + 'Label'.padEnd(30) + '  Time/call       Note');
-console.log('  ' + '-'.repeat(65));
+console.log('\n=== Section 1: Flat struct (8 fields) — untyped / typed / JSON serialize ===\n');
+console.log('  ' + 'Label'.padEnd(32) + '  Time/call       Note');
+console.log('  ' + '-'.repeat(70));
 
 for (const n of [100, 500, 1000, 5000]) {
   const rows = makeUsers(n);
-  const asonText = encode(rows, FLAT_SCHEMA);
-  const jsonText = JSON.stringify(rows);
+  const untypedText = encode(rows);
+  const typedText   = encodeTyped(rows);
+  const jsonText    = JSON.stringify(rows);
   const iters = n <= 1000 ? 200 : 50;
 
-  const asonSer = bench(() => encode(rows, FLAT_SCHEMA), iters);
-  const asonDe  = bench(() => decode(asonText), iters);
-  const jsonSer = bench(() => JSON.stringify(rows), iters);
-  const jsonDe  = bench(() => JSON.parse(jsonText), iters);
+  const untypedSer = bench(() => encode(rows), iters);
+  const typedSer   = bench(() => encodeTyped(rows), iters);
+  const untypedDe  = bench(() => decode(untypedText), iters);
+  const typedDe    = bench(() => decode(typedText), iters);
+  const jsonSer    = bench(() => JSON.stringify(rows), iters);
+  const jsonDe     = bench(() => JSON.parse(jsonText), iters);
 
-  const saving = ((1 - asonText.length / jsonText.length) * 100).toFixed(1);
-  console.log(`\n  N=${n}  ASON ${asonText.length}B vs JSON ${jsonText.length}B  (${saving}% smaller)`);
-  printRow('ASON serialize', asonSer, `${(jsonSer / asonSer).toFixed(2)}× vs JSON`);
-  printRow('ASON deserialize', asonDe, `${(jsonDe / asonDe).toFixed(2)}× vs JSON`);
-  printRow('JSON serialize', jsonSer);
+  const savingUntyped = ((1 - untypedText.length / jsonText.length) * 100).toFixed(1);
+  const savingTyped   = ((1 - typedText.length   / jsonText.length) * 100).toFixed(1);
+  console.log(`\n  N=${n}  ASON untyped ${untypedText.length}B (${savingUntyped}% < JSON) | typed ${typedText.length}B (${savingTyped}% < JSON) | JSON ${jsonText.length}B`);
+  printRow('ASON untyped serialize', untypedSer, `${(jsonSer / untypedSer).toFixed(2)}× vs JSON`);
+  printRow('ASON typed   serialize', typedSer,   `${(jsonSer / typedSer).toFixed(2)}× vs JSON`);
+  printRow('ASON untyped deserialize', untypedDe, `${(jsonDe / untypedDe).toFixed(2)}× vs JSON`);
+  printRow('ASON typed   deserialize', typedDe,   `${(jsonDe / typedDe).toFixed(2)}× vs JSON`);
+  printRow('JSON serialize',  jsonSer);
   printRow('JSON deserialize', jsonDe);
 }
 
@@ -86,57 +100,56 @@ for (const n of [100, 500, 1000, 5000]) {
 // Section 2: All-types struct (7 fields incl. optionals)
 // ---------------------------------------------------------------------------
 console.log('\n=== Section 2: All-types struct (7 fields, with optionals) ===\n');
-console.log('  ' + 'Label'.padEnd(30) + '  Time/call       Note');
-console.log('  ' + '-'.repeat(65));
+console.log('  ' + 'Label'.padEnd(32) + '  Time/call       Note');
+console.log('  ' + '-'.repeat(70));
 
 for (const n of [100, 500]) {
   const rows = makeAllTypes(n);
-  const asonText = encode(rows, ALL_SCHEMA);
-  const jsonText = JSON.stringify(rows);
+  const typedText = encodeTyped(rows);
+  const jsonText  = JSON.stringify(rows);
   const iters = 200;
 
-  const asonSer = bench(() => encode(rows, ALL_SCHEMA), iters);
-  const asonDe  = bench(() => decode(asonText), iters);
-  const jsonSer = bench(() => JSON.stringify(rows), iters);
-  const jsonDe  = bench(() => JSON.parse(jsonText), iters);
+  const typedSer = bench(() => encodeTyped(rows), iters);
+  const typedDe  = bench(() => decode(typedText), iters);
+  const jsonSer  = bench(() => JSON.stringify(rows), iters);
+  const jsonDe   = bench(() => JSON.parse(jsonText), iters);
 
-  const saving = ((1 - asonText.length / jsonText.length) * 100).toFixed(1);
-  console.log(`\n  N=${n}  ASON ${asonText.length}B vs JSON ${jsonText.length}B  (${saving}% smaller)`);
-  printRow('ASON serialize', asonSer, `${(jsonSer / asonSer).toFixed(2)}× vs JSON`);
-  printRow('ASON deserialize', asonDe, `${(jsonDe / asonDe).toFixed(2)}× vs JSON`);
-  printRow('JSON serialize', jsonSer);
+  const saving = ((1 - typedText.length / jsonText.length) * 100).toFixed(1);
+  console.log(`\n  N=${n}  ASON typed ${typedText.length}B vs JSON ${jsonText.length}B  (${saving}% smaller)`);
+  printRow('ASON typed serialize',   typedSer, `${(jsonSer / typedSer).toFixed(2)}× vs JSON`);
+  printRow('ASON typed deserialize', typedDe,  `${(jsonDe  / typedDe).toFixed(2)}× vs JSON`);
+  printRow('JSON serialize',  jsonSer);
   printRow('JSON deserialize', jsonDe);
 }
 
 // ---------------------------------------------------------------------------
-// Section 3: Binary vs text vs JSON
+// Section 3: Binary vs typed text vs JSON
 // ---------------------------------------------------------------------------
-console.log('\n=== Section 3: Binary vs text vs JSON ===\n');
-console.log('  ' + 'Label'.padEnd(30) + '  Time/call       Size');
-console.log('  ' + '-'.repeat(65));
+console.log('\n=== Section 3: Binary vs typed text vs JSON ===\n');
+console.log('  ' + 'Label'.padEnd(32) + '  Time/call       Size');
+console.log('  ' + '-'.repeat(70));
 
 for (const n of [100, 1000]) {
-  const rows = makeUsers(n);
-  const schema = FLAT_SCHEMA;
-  const asonText = encode(rows, schema);
-  const binData  = encodeBinary(rows, schema);
-  const jsonText = JSON.stringify(rows);
-  const iters = 100;
+  const rows      = makeUsers(n);
+  const typedText = encodeTyped(rows);
+  const binData   = encodeBinary(rows);          // schema inferred internally
+  const jsonText  = JSON.stringify(rows);
+  const iters     = 100;
 
-  const binSer  = bench(() => encodeBinary(rows, schema), iters);
-  const binDe   = bench(() => decodeBinary(binData, schema), iters);
-  const asonSer = bench(() => encode(rows, schema), iters);
-  const asonDe  = bench(() => decode(asonText), iters);
-  const jsonSer = bench(() => JSON.stringify(rows), iters);
-  const jsonDe  = bench(() => JSON.parse(jsonText), iters);
+  const binSer   = bench(() => encodeBinary(rows), iters);
+  const binDe    = bench(() => decodeBinary(binData, FLAT_SCHEMA_BIN), iters);
+  const typedSer = bench(() => encodeTyped(rows), iters);
+  const typedDe  = bench(() => decode(typedText), iters);
+  const jsonSer  = bench(() => JSON.stringify(rows), iters);
+  const jsonDe   = bench(() => JSON.parse(jsonText), iters);
 
   console.log(`\n  N=${n}`);
-  printRow('BIN serialize',   binSer,  `${binData.length} B  (${((1 - binData.length / jsonText.length) * 100).toFixed(0)}% < JSON)`);
-  printRow('BIN deserialize', binDe,   `${(jsonDe / binDe).toFixed(2)}× vs JSON`);
-  printRow('ASON serialize',  asonSer, `${asonText.length} B  (${((1 - asonText.length / jsonText.length) * 100).toFixed(0)}% < JSON)`);
-  printRow('ASON deserialize',asonDe,  `${(jsonDe / asonDe).toFixed(2)}× vs JSON`);
+  printRow('BIN serialize',         binSer,   `${binData.length} B  (${((1 - binData.length / jsonText.length) * 100).toFixed(0)}% < JSON)`);
+  printRow('BIN deserialize',       binDe,    `${(jsonDe / binDe).toFixed(2)}× vs JSON`);
+  printRow('ASON typed serialize',  typedSer, `${typedText.length} B  (${((1 - typedText.length / jsonText.length) * 100).toFixed(0)}% < JSON)`);
+  printRow('ASON typed deserialize',typedDe,  `${(jsonDe / typedDe).toFixed(2)}× vs JSON`);
   printRow('JSON serialize',  jsonSer, `${jsonText.length} B`);
-  printRow('JSON deserialize',jsonDe);
+  printRow('JSON deserialize', jsonDe);
 }
 
 // ---------------------------------------------------------------------------
@@ -144,20 +157,22 @@ for (const n of [100, 1000]) {
 // ---------------------------------------------------------------------------
 console.log('\n=== Section 4: Single struct roundtrip (10 000 iters) ===\n');
 {
-  const obj = { id: 1, name: 'Alice', score: 9.5, active: true };
+  const obj  = { id: 1, name: 'Alice', score: 9.5, active: true };
+  const typed = encodeTyped(obj);
+  const data  = encodeBinary(obj);
   const schema = '{id:int, name:str, score:float, active:bool}';
-  const text = encode(obj, schema);
-  const data = encodeBinary(obj, schema);
 
-  const textSer = bench(() => encode(obj, schema), 10000);
-  const textDe  = bench(() => decode(text), 10000);
-  const binSer  = bench(() => encodeBinary(obj, schema), 10000);
-  const binDe   = bench(() => decodeBinary(data, schema), 10000);
+  const typedSer  = bench(() => encodeTyped(obj), 10000);
+  const typedDe   = bench(() => decode(typed), 10000);
+  const binSer    = bench(() => encodeBinary(obj), 10000);
+  const binDe     = bench(() => decodeBinary(data, schema), 10000);
+  const untypedSer = bench(() => encode(obj), 10000);
 
-  printRow('Text serialize',  textSer);
-  printRow('Text deserialize',textDe);
-  printRow('Bin serialize',   binSer);
-  printRow('Bin deserialize', binDe);
+  printRow('Typed text serialize',   typedSer);
+  printRow('Typed text deserialize', typedDe);
+  printRow('Untyped text serialize', untypedSer);
+  printRow('Bin serialize',          binSer);
+  printRow('Bin deserialize',        binDe);
 }
 
 // ---------------------------------------------------------------------------
@@ -166,49 +181,45 @@ console.log('\n=== Section 4: Single struct roundtrip (10 000 iters) ===\n');
 console.log('\n=== Section 5: Large payload (10 000 records) ===\n');
 {
   const rows = makeUsers(10000);
-  const schema = FLAT_SCHEMA;
-  const iters = 10;
+  const iters     = 10;
+  const typedText = encodeTyped(rows);
+  const jsonText  = JSON.stringify(rows);
+  const binData   = encodeBinary(rows);
 
-  const asonText = encode(rows, schema);
-  const jsonText = JSON.stringify(rows);
-  const binData  = encodeBinary(rows, schema);
+  const typedSer = bench(() => encodeTyped(rows), iters);
+  const typedDe  = bench(() => decode(typedText), iters);
+  const jsonSer  = bench(() => JSON.stringify(rows), iters);
+  const jsonDe   = bench(() => JSON.parse(jsonText), iters);
+  const binSer   = bench(() => encodeBinary(rows), iters);
+  const binDe    = bench(() => decodeBinary(binData, FLAT_SCHEMA_BIN), iters);
 
-  const asonSer = bench(() => encode(rows, schema), iters);
-  const asonDe  = bench(() => decode(asonText), iters);
-  const jsonSer = bench(() => JSON.stringify(rows), iters);
-  const jsonDe  = bench(() => JSON.parse(jsonText), iters);
-  const binSer  = bench(() => encodeBinary(rows, schema), iters);
-  const binDe   = bench(() => decodeBinary(binData, schema), iters);
-
-  printRow('ASON serialize',  asonSer, `${asonText.length} B`);
-  printRow('ASON deserialize',asonDe);
-  printRow('BIN serialize',   binSer,  `${binData.length} B`);
-  printRow('BIN deserialize', binDe);
+  printRow('ASON typed serialize',  typedSer, `${typedText.length} B`);
+  printRow('ASON typed deserialize',typedDe);
+  printRow('BIN serialize',         binSer,   `${binData.length} B`);
+  printRow('BIN deserialize',       binDe);
   printRow('JSON serialize',  jsonSer, `${jsonText.length} B`);
-  printRow('JSON deserialize',jsonDe);
+  printRow('JSON deserialize', jsonDe);
 }
 
 // ---------------------------------------------------------------------------
-// Section 6: Throughput summary (text)
+// Section 6: Throughput summary (typed text)
 // ---------------------------------------------------------------------------
-console.log('\n=== Section 6: Throughput summary (text) ===\n');
+console.log('\n=== Section 6: Throughput summary (typed text) ===\n');
 {
-  const n = 1000;
-  const rows = makeUsers(n);
-  const schema = FLAT_SCHEMA;
-  const text = encode(rows, schema);
+  const n     = 1000;
+  const rows  = makeUsers(n);
+  const text  = encodeTyped(rows);
   const iters = 100;
 
-  const serNs = bench(() => encode(rows, schema), iters);
-  const deNs  = bench(() => decode(text), iters);
+  const serNs  = bench(() => encodeTyped(rows), iters);
+  const deNs   = bench(() => decode(text), iters);
   const jsonSer = bench(() => JSON.stringify(rows), iters);
-  const jsonDe  = bench(() => JSON.parse(text.length > 0 ? JSON.stringify(rows) : '[]'), iters);
+  const jsonDeNs = bench(() => JSON.parse(JSON.stringify(rows)), iters);
 
-  const serRps = Math.round(n / (serNs / 1e9));
-  const deRps  = Math.round(n / (deNs / 1e9));
-
+  const serRps     = Math.round(n / (serNs / 1e9));
+  const deRps      = Math.round(n / (deNs / 1e9));
   const jsonSerRps = Math.round(n / (jsonSer / 1e9));
-  const jsonDeRps  = Math.round(n / (bench(() => JSON.parse(JSON.stringify(rows)), iters) / 1e9));
+  const jsonDeRps  = Math.round(n / (jsonDeNs / 1e9));
 
   console.log(`  Serialize:   ${(serRps / 1e6).toFixed(2)} M records/s  (${(serRps / jsonSerRps).toFixed(2)}× vs JSON)`);
   console.log(`  Deserialize: ${(deRps / 1e6).toFixed(2)} M records/s  (${(deRps / jsonDeRps).toFixed(2)}× vs JSON)`);
@@ -219,14 +230,13 @@ console.log('\n=== Section 6: Throughput summary (text) ===\n');
 // ---------------------------------------------------------------------------
 console.log('\n=== Section 7: Binary throughput summary ===\n');
 {
-  const n = 1000;
-  const rows = makeUsers(n);
-  const schema = FLAT_SCHEMA;
-  const data = encodeBinary(rows, schema);
+  const n     = 1000;
+  const rows  = makeUsers(n);
+  const data  = encodeBinary(rows);    // schema inferred
   const iters = 100;
 
-  const binSerNs = bench(() => encodeBinary(rows, schema), iters);
-  const binDeNs  = bench(() => decodeBinary(data, schema), iters);
+  const binSerNs = bench(() => encodeBinary(rows), iters);
+  const binDeNs  = bench(() => decodeBinary(data, FLAT_SCHEMA_BIN), iters);
 
   const binSerRps = Math.round(n / (binSerNs / 1e9));
   const binDeRps  = Math.round(n / (binDeNs / 1e9));

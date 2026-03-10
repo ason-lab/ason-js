@@ -50,75 +50,102 @@ TypeScript users do not need a separate stub package. `npm run build` emits `dis
 ## Quick start
 
 ```ts
-import { encode, decode, encodePretty, encodeBinary, decodeBinary } from 'ason-js';
+import { encode, encodeTyped, encodePretty, encodePrettyTyped,
+         decode, encodeBinary, decodeBinary } from 'ason-js';
 
 const users = [
   { id: 1, name: 'Alice', score: 9.5 },
   { id: 2, name: 'Bob',   score: 7.2 },
 ];
-const schema = '[{id:int, name:str, score:float}]';
 
-const text   = encode(users, schema);
-const pretty = encodePretty(users, schema);
-const blob   = encodeBinary(users, schema);
+// Schema is inferred automatically — no schema string needed
+const text        = encode(users);           // untyped schema
+const textTyped   = encodeTyped(users);      // typed  schema (use for typed round-trip)
+const pretty      = encodePretty(users);     // pretty + untyped
+const prettyTyped = encodePrettyTyped(users);// pretty + typed
+const blob        = encodeBinary(users);     // binary (schema inferred internally)
 
-console.log(decode(text));               // original array restored
-console.log(decode(pretty));             // same result from pretty text
-console.log(decodeBinary(blob, schema)); // same result from binary
+console.log(decode(textTyped));              // original array restored
+console.log(decode(prettyTyped));            // same from pretty
+console.log(decodeBinary(blob, '[{id:int, name:str, score:float}]')); // binary decode
 ```
+
+> **Note on `encode` vs `encodeTyped`**
+> `encode(obj)` emits an *untyped* schema (`{id,name}`) so the output is shorter.
+> When decoded, all values without explicit types are returned as strings.
+> Use `encodeTyped(obj)` when you need the round-trip to preserve numeric and boolean types.
 
 ---
 
 ## API
 
+### Type inference rules
+
+| JS value | Inferred ASON type |
+|----------|--------------------|
+| integer `number` | `int` |
+| fractional `number` | `float` |
+| `boolean` | `bool` |
+| `string` | `str` |
+| `null` / `undefined` | `str?` (optional) |
+
+> **Note:** Schema is inferred from the **first element** of an array. To make a field optional (`str?`), ensure the first element has `null` for that field.
+
+### `encode(obj) → string`
+
+Serialize a plain object or array to ASON text with an **inferred untyped** schema.
+All values are written without type annotations. When decoded, all fields come back as **strings**:
+
 ```ts
-// Schema string formats:
-//   Single struct:  "{field:type, ...}"
-//   Slice:          "[{field:type, ...}]"
-//
-// Types: int  uint  float  bool  str
-// Optional: add '?' suffix  →  str?  int?  float?  ...
+encode({ id: 1, name: 'Alice' });
+// → '{id,name}:\n(1,Alice)\n'
+
+encode([{ id: 1 }, { id: 2 }]);
+// → '[{id}]:\n(1),\n(2)\n'
+
+decode(encode({ id: 1, name: 'Alice' }));
+// → { id: '1', name: 'Alice' }  ← all strings when schema is untyped
 ```
 
-### `encode(obj, schema) → string`
+Use `encodeTyped` when you need `decode` to restore the original types.
 
-Serialize a plain object or array of objects to ASON text:
+### `encodeTyped(obj) → string`
+
+Same as `encode` but emits an **inferred typed** schema. Use this when you want `decode()` to restore the original types:
 
 ```ts
-const text = encode({ id: 1, name: 'Alice' }, '{id:int, name:str}');
-// → '{id:int, name:str}:\n(1,Alice)\n'
-
-const text2 = encode(rows, '[{id:int, name:str}]');
+encodeTyped({ id: 1, name: 'Alice', active: true });
+// → '{id:int,name:str,active:bool}:\n(1,Alice,true)\n'
 ```
+
+### `encodePretty(obj) → string`
+
+Pretty-printed ASON text with **inferred untyped** schema.
+
+### `encodePrettyTyped(obj) → string`
+
+Pretty-printed ASON text with **inferred typed** schema.
 
 ### `decode(text) → object | object[]`
 
-Deserialize ASON text back to a plain object or array:
+Deserialize ASON text. The schema is embedded in the text itself:
 
 ```ts
 const rec  = decode('{id:int, name:str}:\n(1,Alice)\n');
 const rows = decode('[{id:int, name:str}]:\n(1,Alice),\n(2,Bob)\n');
 ```
 
-### `encodePretty(obj, schema) → string`
+### `encodeBinary(obj) → Uint8Array`
 
-Serialize with smart indentation for readability:
-
-```ts
-const pretty = encodePretty(rows, '[{id:int, name:str}]');
-```
-
-### `encodeBinary(obj, schema) → Uint8Array`
-
-Serialize to binary format (byte-compatible with ason-rs and ason-go):
+Serialize to binary format. **Schema is inferred internally** — no schema string needed:
 
 ```ts
-const data = encodeBinary(rows, '[{id:int, name:str}]');
+const data = encodeBinary(rows);
 ```
 
 ### `decodeBinary(data, schema) → object | object[]`
 
-Deserialize from binary format:
+Deserialize from binary format. **Schema is required** because the binary wire format carries no embedded type information:
 
 ```ts
 const rows = decodeBinary(data, '[{id:int, name:str}]');
@@ -146,7 +173,7 @@ Optional fields: append `?` to any type (`str?`, `int?`, `float?`, `bool?`, `uin
 ```html
 <script src="dist/ason.min.js"></script>
 <script>
-  const text = ASON.encode([{id:1, name:'Alice'}], '[{id:int, name:str}]');
+  const text = ASON.encodeTyped([{id:1, name:'Alice'}]);
   console.log(ASON.decode(text));
 </script>
 ```
@@ -155,8 +182,8 @@ Optional fields: append `?` to any type (`str?`, `int?`, `float?`, `bool?`, `uin
 
 ```html
 <script type="module">
-  import { encode, decode } from './dist/index.js';
-  const text = encode([{id:1, name:'Alice'}], '[{id:int, name:str}]');
+  import { encodeTyped, decode } from './dist/index.js';
+  const text = encodeTyped([{id:1, name:'Alice'}]);
   console.log(decode(text));
 </script>
 ```
@@ -167,11 +194,11 @@ Works as a regular npm package — just import and use:
 
 ```ts
 // Vue composable example
-import { encode, decode } from 'ason-js';
+import { encodeTyped, decode } from 'ason-js';
 
-export function useAson(schema: string) {
-  const serialize = (data: object[]) => encode(data, schema);
-  const deserialize = (text: string) => decode(text);
+export function useAson() {
+  const serialize   = (data: object[]) => encodeTyped(data);
+  const deserialize = (text: string)   => decode(text);
   return { serialize, deserialize };
 }
 ```
@@ -199,7 +226,7 @@ Little-endian layout, byte-identical to ason-rs and ason-go:
 ```bash
 npm install
 npm run build    # generates dist/index.js, dist/index.cjs, dist/index.d.ts, dist/ason.min.js
-npm test         # vitest, 40 tests
+npm test         # vitest, 46 tests
 ```
 
 ---

@@ -1,8 +1,20 @@
 /**
- * ason-js — basic usage examples
+ * ason-js — basic usage examples (inference-driven API)
  * Run: node examples/basic.js  (after npm run build)
+ *
+ * API used:
+ *   encode(obj)         → untyped schema text  (shorter, decode gives strings)
+ *   encodeTyped(obj)    → typed schema text    (full round-trip fidelity)
+ *   encodePretty(obj)   → pretty + untyped
+ *   encodePrettyTyped(obj) → pretty + typed
+ *   encodeBinary(obj)   → Uint8Array (schema inferred internally)
+ *   decode(text)        → object | object[]
+ *   decodeBinary(data, schema) → object | object[] (schema required for binary)
  */
-import { encode, decode, encodePretty, encodeBinary, decodeBinary } from '../dist/index.js';
+import {
+  encode, encodeTyped, encodePretty, encodePrettyTyped,
+  decode, encodeBinary, decodeBinary,
+} from '../dist/index.js';
 
 let passed = 0;
 function check(label, got, expected) {
@@ -15,104 +27,111 @@ function check(label, got, expected) {
 console.log('\n=== ason-js basic examples ===\n');
 
 // ---------------------------------------------------------------------------
-// 1. Single struct encode/decode
+// 1. Single struct — typed round-trip via encodeTyped
 // ---------------------------------------------------------------------------
-console.log('1. Single struct');
+console.log('1. Single struct (typed round-trip)');
 {
   const user = { id: 1, name: 'Alice', active: true };
-  const schema = '{id:int, name:str, active:bool}';
-  const text = encode(user, schema);
+  const text = encodeTyped(user);
   console.log('   encoded:', JSON.stringify(text));
   check('roundtrip', decode(text), user);
 }
 
 // ---------------------------------------------------------------------------
-// 2. Slice encode/decode
+// 2. Slice of structs — typed round-trip via encodeTyped
 // ---------------------------------------------------------------------------
-console.log('2. Slice of structs');
+console.log('2. Slice of structs (typed round-trip)');
 {
   const users = [
     { id: 1, name: 'Alice', active: true },
     { id: 2, name: 'Bob',   active: false },
     { id: 3, name: 'Carol', active: true },
   ];
-  const schema = '[{id:int, name:str, active:bool}]';
-  const text = encode(users, schema);
+  const text = encodeTyped(users);
   console.log('   encoded:\n' + text);
   check('slice roundtrip', decode(text), users);
 }
 
 // ---------------------------------------------------------------------------
-// 3. Float and negative numbers
+// 3. encode() — untyped schema: shorter output, types become strings on decode
 // ---------------------------------------------------------------------------
-console.log('3. Float and negative integers');
+console.log('3. encode() — untyped schema (shorter text)');
+{
+  const users = [{ id: 1, name: 'Alice' }, { id: 2, name: 'Bob' }];
+  const text = encode(users);
+  console.log('   untyped text:\n' + text);
+  // NOTE: untyped decode returns all values as strings
+  const decoded = decode(text);
+  check('untyped slice header', text.startsWith('[{id,name}]:'), true);
+  // id comes back as string '1' without type; use encodeTyped for full fidelity
+  check('str name roundtrip', decoded[0].name, 'Alice');
+}
+
+// ---------------------------------------------------------------------------
+// 4. Float and negative numbers
+// ---------------------------------------------------------------------------
+console.log('4. Float and negative integers');
 {
   const rec = { score: 9.5, delta: -0.25, count: -42 };
-  const schema = '{score:float, delta:float, count:int}';
-  check('float/neg roundtrip', decode(encode(rec, schema)), rec);
+  check('float/neg roundtrip', decode(encodeTyped(rec)), rec);
 }
 
 // ---------------------------------------------------------------------------
-// 4. Optional fields
+// 5. Optional fields (inferred as str?)
 // ---------------------------------------------------------------------------
-console.log('4. Optional fields');
+console.log('5. Optional fields (null → inferred str?)');
 {
-  const schema = '{id:int, tag:str?, rating:float?}';
-  const a = { id: 1, tag: 'hello', rating: 4.5 };
-  const b = { id: 2, tag: null,    rating: null };
-  check('optional present', decode(encode(a, schema)), a);
-  check('optional null',    decode(encode(b, schema)), b);
+  const a = { id: 1, tag: 'hello' };
+  const b = { id: 2, tag: null   };
+  // For optional fields: note that null infers to str?; encode then decode
+  // b.tag will be null in both typed and untyped forms
+  const ta = encodeTyped(a);
+  const tb = encodeTyped(b);
+  check('optional present header', ta.includes('tag:str'), true);
+  check('optional null header',    tb.includes('tag:str?'), true);
+  // typed round-trip for non-null:
+  check('optional present value', decode(ta).tag, a.tag);
+  check('optional null value',    decode(tb).tag, null);
 }
 
 // ---------------------------------------------------------------------------
-// 5. String quoting
+// 6. String quoting (typed round-trip)
 // ---------------------------------------------------------------------------
-console.log('5. String quoting');
+console.log('6. String quoting');
 {
-  const schema = '{name:str}';
   for (const name of ['Alice', 'Smith, John', 'f(x)', '', 'true', '42', 'C:\\path']) {
-    check(`quote: ${JSON.stringify(name)}`, decode(encode({ name }, schema)), { name });
+    check(`quote: ${JSON.stringify(name)}`, decode(encodeTyped({ name })).name, name);
   }
 }
 
 // ---------------------------------------------------------------------------
-// 6. encodePretty
+// 7. encodePrettyTyped (typed + pretty, full round-trip)
 // ---------------------------------------------------------------------------
-console.log('6. encodePretty');
+console.log('7. encodePrettyTyped');
 {
   const rows = [
     { id: 1, name: 'Alice', score: 9.5 },
     { id: 2, name: 'Bob',   score: 7.2 },
   ];
-  const schema = '[{id:int, name:str, score:float}]';
-  const pretty = encodePretty(rows, schema);
+  const pretty = encodePrettyTyped(rows);
   console.log('   pretty:\n' + pretty);
-  check('pretty roundtrip', decode(pretty), rows);
+  check('pretty typed roundtrip', decode(pretty), rows);
 }
 
 // ---------------------------------------------------------------------------
-// 7. encodeBinary / decodeBinary
+// 8. encodeBinary / decodeBinary (schema inferred for encode, required for decode)
 // ---------------------------------------------------------------------------
-console.log('7. Binary encode/decode');
+console.log('8. Binary encode/decode');
 {
   const rows = [
     { id: 1, name: 'Alice', score: 9.5,  active: true  },
     { id: 2, name: 'Bob',   score: 7.125, active: false },
   ];
-  const schema = '[{id:int, name:str, score:float, active:bool}]';
-  const data = encodeBinary(rows, schema);
+  const data = encodeBinary(rows);
   console.log(`   binary size: ${data.length} bytes`);
+  // schema required for decodeBinary (binary wire has no embedded types)
+  const schema = '[{id:int, name:str, score:float, active:bool}]';
   check('binary roundtrip', decodeBinary(data, schema), rows);
-}
-
-// ---------------------------------------------------------------------------
-// 8. uint field
-// ---------------------------------------------------------------------------
-console.log('8. uint field');
-{
-  const obj = { n: 9007199254740991 }; // Number.MAX_SAFE_INTEGER
-  check('uint roundtrip', decode(encode(obj, '{n:uint}')), obj);
-  check('uint binary roundtrip', decodeBinary(encodeBinary(obj, '{n:uint}'), '{n:uint}'), obj);
 }
 
 // ---------------------------------------------------------------------------
@@ -123,12 +142,15 @@ console.log('9. Size comparison vs JSON');
   const rows = Array.from({ length: 100 }, (_, i) => ({
     id: i, name: `User${i}`, score: i * 0.5, active: i % 2 === 0,
   }));
-  const schema = '[{id:int, name:str, score:float, active:bool}]';
-  const asonText = encode(rows, schema);
+  const asonText = encode(rows);       // untyped: shortest output
+  const asonTyped = encodeTyped(rows); // typed: still much shorter than JSON
   const json = JSON.stringify(rows);
-  const saving = (1 - asonText.length / json.length) * 100;
-  console.log(`   ASON: ${asonText.length} bytes, JSON: ${json.length} bytes, saving: ${saving.toFixed(1)}%`);
-  check('size saving > 20%', saving > 20, true);
+  const savingUntyped = (1 - asonText.length / json.length) * 100;
+  const savingTyped   = (1 - asonTyped.length / json.length) * 100;
+  console.log(`   ASON untyped: ${asonText.length} B, ASON typed: ${asonTyped.length} B, JSON: ${json.length} B`);
+  console.log(`   Saving untyped: ${savingUntyped.toFixed(1)}%,  typed: ${savingTyped.toFixed(1)}%`);
+  check('untyped saving > 20%', savingUntyped > 20, true);
+  check('typed  saving > 20%', savingTyped  > 20, true);
 }
 
 console.log(`\nResult: ${passed} passed`);

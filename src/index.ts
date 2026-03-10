@@ -5,16 +5,24 @@
  * Compatible with Vue, React, Svelte, SolidJS, and any JS framework.
  *
  * API:
- *   encode(obj, schema)            → string
+ *   encode(obj)                    → string   (untyped schema, inferred)
+ *   encodeTyped(obj)               → string   (typed schema, inferred)
+ *   encodePretty(obj)              → string   (pretty + untyped schema)
+ *   encodePrettyTyped(obj)         → string   (pretty + typed schema)
  *   decode(text)                   → object | object[]
- *   encodePretty(obj, schema)      → string
- *   encodeBinary(obj, schema)      → Uint8Array
+ *   encodeBinary(obj)              → Uint8Array (schema inferred internally)
  *   decodeBinary(data, schema)     → object | object[]
  *
- * Schema strings:
- *   Single:  "{id:int, name:str, active:bool}"
- *   Slice:   "[{id:int, name:str, active:bool}]"
- *   Types:   int  uint  float  bool  str  (+ ? suffix for optional)
+ * Type inference rules (matches ason-go / ason-rs / ason-java behaviour):
+ *   JS number (integer)  → int
+ *   JS number (fraction) → float
+ *   JS boolean           → bool
+ *   JS string            → str
+ *   null / undefined     → str? (optional str)
+ *   Arrays are encoded as schema-once slices.
+ *
+ * decodeBinary still requires an explicit schema string because the binary
+ * format carries no embedded type information. All other APIs are schema-free.
  */
 
 // ---------------------------------------------------------------------------
@@ -42,7 +50,6 @@ interface ParsedSchema {
 // Character tables
 // ---------------------------------------------------------------------------
 
-// Bytes that force string to be wrapped in "..."
 const NEEDS_QUOTE = new Uint8Array(256);
 for (let i = 0; i < 32; i++) NEEDS_QUOTE[i] = 1;
 for (const ch of [',', '(', ')', '[', ']', '"', '\\']) {
@@ -50,13 +57,49 @@ for (const ch of [',', '(', ')', '[', ']', '"', '\\']) {
 }
 
 // ---------------------------------------------------------------------------
-// Schema parsing
+// Type inference: derive field list from an object
 // ---------------------------------------------------------------------------
 
-// Schema cache — avoid reparsing the same schema string
+function inferBaseType(val: unknown): BaseType {
+  if (typeof val === 'boolean') return 'bool';
+  if (typeof val === 'number') {
+    return Number.isInteger(val) ? 'int' : 'float';
+  }
+  if (typeof val === 'bigint') return 'int';
+  return 'str';
+}
+
+/** Infer a Field array from a sample object (or the first element of an array). */
+function inferFields(sample: AsonObj): Field[] {
+  return Object.keys(sample).map(name => {
+    const val = sample[name];
+    const optional = val === null || val === undefined;
+    const base: BaseType = optional ? 'str' : inferBaseType(val);
+    return { name, base, optional };
+  });
+}
+
+/** Build an untyped schema header string, e.g. "{id,name,active}" or "[{...}]" */
+function buildUntypedHeader(fields: Field[], isSlice: boolean): string {
+  const inner = '{' + fields.map(f => f.name).join(',') + '}';
+  return isSlice ? '[' + inner + ']' : inner;
+}
+
+/** Build a typed schema header string, e.g. "{id:int,name:str,active:bool}" */
+function buildTypedHeader(fields: Field[], isSlice: boolean): string {
+  const inner = '{' + fields.map(f => {
+    const t: string = f.optional ? f.base + '?' : f.base;
+    return f.name + ':' + t;
+  }).join(',') + '}';
+  return isSlice ? '[' + inner + ']' : inner;
+}
+
+// ---------------------------------------------------------------------------
+// Schema parsing (for decodeBinary and decode())
+// ---------------------------------------------------------------------------
+
 const _schemaCache = new Map<string, ParsedSchema>();
 
-/** Parse a schema string like "{id:int, name:str}" or "[{id:int}]". */
 function parseSchema(schema: string): ParsedSchema {
   const cached = _schemaCache.get(schema);
   if (cached) return cached;
@@ -90,7 +133,6 @@ function parseSchemaInner(schema: string): ParsedSchema {
       skip();
     }
 
-    // Field name
     const ns = pos;
     while (pos < n && schema[pos] !== ':' && schema[pos] !== ',' && schema[pos] !== '}' && schema[pos] !== ' ' && schema[pos] !== '\t') pos++;
     const name = schema.slice(ns, pos);
@@ -98,12 +140,10 @@ function parseSchemaInner(schema: string): ParsedSchema {
 
     skip();
 
-    // Optional type annotation
     let typePart: FieldType = 'str';
     if (pos < n && schema[pos] === ':') {
       pos++; // consume ':'
       skip();
-      // Skip nested braces/brackets (not used in flat schema but tolerated)
       if (pos < n && (schema[pos] === '{' || schema[pos] === '[')) {
         const open = schema[pos]; const close = open === '{' ? '}' : ']';
         let depth = 0;
@@ -178,19 +218,16 @@ function encodeStr(s: string): string {
 }
 
 function formatFloat(v: number): string {
-  if (!isFinite(v)) return '0'; // nan/inf → 0 (ASON convention)
+  if (!isFinite(v)) return '0';
   if (Object.is(v, -0)) return '0';
-  // Integer-valued float → append ".0"
   if (Number.isInteger(v)) return v.toFixed(1);
-  // Up to 15 significant digits, trim trailing zeros
   let s = v.toPrecision(15).replace(/\.?0+$/, '');
-  // Ensure there's a decimal point for floats
   if (!s.includes('.')) s += '.0';
   return s;
 }
 
 // ---------------------------------------------------------------------------
-// Encode value according to field type
+// Encode a single value given its inferred type
 // ---------------------------------------------------------------------------
 
 function encodeValue(val: unknown, base: BaseType, optional: boolean): string {
@@ -205,38 +242,28 @@ function encodeValue(val: unknown, base: BaseType, optional: boolean): string {
 }
 
 // ---------------------------------------------------------------------------
-// Encode tuple (one row)
+// Encode tuple (one row) using inferred fields
 // ---------------------------------------------------------------------------
 
 function encodeTuple(obj: AsonObj, fields: Field[]): string {
   let s = '(';
   for (let i = 0; i < fields.length; i++) {
     if (i > 0) s += ',';
-    const f = fields[i];
+    const f = fields[i]!;
     s += encodeValue(obj[f.name], f.base, f.optional);
   }
   return s + ')';
 }
 
 // ---------------------------------------------------------------------------
-// Build schema header string (always typed — schema is the user input)
+// encode(obj) → string   [untyped schema, inferred]
 // ---------------------------------------------------------------------------
 
-function schemaHeader(schema: string, isSlice: boolean): string {
-  // We emit the schema as given, normalised (no extra spaces)
-  return schema.trim();
-}
-
-// ---------------------------------------------------------------------------
-// encode(obj, schema) → string
-// ---------------------------------------------------------------------------
-
-export function encode(obj: AsonResult, schema: string): string {
-  const parsed = parseSchema(schema);
-  const { fields, isSlice: schemaIsSlice } = parsed;
-
+export function encode(obj: AsonResult): string {
   if (Array.isArray(obj)) {
-    const hdr = schemaIsSlice ? schema.trim() : `[${schema.trim()}]`;
+    if (obj.length === 0) return '[{}]:\n';
+    const fields = inferFields(obj[0]!);
+    const hdr = buildUntypedHeader(fields, true);
     let out = hdr + ':\n';
     for (let i = 0; i < obj.length; i++) {
       out += encodeTuple(obj[i]!, fields);
@@ -245,28 +272,58 @@ export function encode(obj: AsonResult, schema: string): string {
     out += '\n';
     return out;
   } else {
-    const hdr = !schemaIsSlice ? schema.trim() : schema.trim().slice(1, -1); // strip [] if slice schema given
-    return hdr + ':\n' + encodeTuple(obj, fields) + '\n';
+    const fields = inferFields(obj as AsonObj);
+    const hdr = buildUntypedHeader(fields, false);
+    return hdr + ':\n' + encodeTuple(obj as AsonObj, fields) + '\n';
   }
 }
 
 // ---------------------------------------------------------------------------
-// encodePretty(obj, schema) → string
+// encodeTyped(obj) → string  [typed schema, inferred]
 // ---------------------------------------------------------------------------
 
-export function encodePretty(obj: AsonResult, schema: string): string {
-  const compact = encode(obj, schema);
-  return prettyFormat(compact);
+export function encodeTyped(obj: AsonResult): string {
+  if (Array.isArray(obj)) {
+    if (obj.length === 0) return '[{}]:\n';
+    const fields = inferFields(obj[0]!);
+    const hdr = buildTypedHeader(fields, true);
+    let out = hdr + ':\n';
+    for (let i = 0; i < obj.length; i++) {
+      out += encodeTuple(obj[i]!, fields);
+      if (i < obj.length - 1) out += ',\n';
+    }
+    out += '\n';
+    return out;
+  } else {
+    const fields = inferFields(obj as AsonObj);
+    const hdr = buildTypedHeader(fields, false);
+    return hdr + ':\n' + encodeTuple(obj as AsonObj, fields) + '\n';
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Pretty formatter — smart indentation
+// encodePretty(obj) → string  [pretty + untyped schema]
+// ---------------------------------------------------------------------------
+
+export function encodePretty(obj: AsonResult): string {
+  return prettyFormat(encode(obj));
+}
+
+// ---------------------------------------------------------------------------
+// encodePrettyTyped(obj) → string  [pretty + typed schema]
+// ---------------------------------------------------------------------------
+
+export function encodePrettyTyped(obj: AsonResult): string {
+  return prettyFormat(encodeTyped(obj));
+}
+
+// ---------------------------------------------------------------------------
+// Pretty formatter
 // ---------------------------------------------------------------------------
 
 const PRETTY_MAX_WIDTH = 100;
 
 function prettyFormat(src: string): string {
-  // Build matching bracket lookup
   const match = buildMatchTable(src);
   const f = new PrettyFmt(src, match);
   f.writeTop();
@@ -311,8 +368,6 @@ class PrettyFmt {
   writeTop(): void {
     const src = this.src;
     const n = src.length;
-    // Find the ':' that separates schema from data:
-    // it is the first ':' at bracket-depth 0 (colons inside {}/{} are at depth ≥ 1).
     let depth = 0;
     let sepIdx = -1;
     let inQ = false;
@@ -325,11 +380,10 @@ class PrettyFmt {
       else if (c === ':' && depth === 0) { sepIdx = i; break; }
     }
     if (sepIdx === -1) { this.out = src; return; }
-    this.out += src.slice(0, sepIdx + 1); // schema header + ':'
+    this.out += src.slice(0, sepIdx + 1);
     this.pos = sepIdx + 1;
     this.skipNewlines();
     this.out += '\n';
-    // Write rows
     while (this.pos < n) {
       this.skipWhitespaceAndCommas();
       if (this.pos >= n) break;
@@ -351,7 +405,7 @@ class PrettyFmt {
 
   writeTuple(): void {
     this.out += '(\n';
-    this.pos++; // '('
+    this.pos++;
     this.depth++;
     let first = true;
     while (this.pos < this.src.length && this.src[this.pos] !== ')') {
@@ -364,7 +418,7 @@ class PrettyFmt {
     }
     this.depth--;
     this.out += '\n' + this.indent() + ')';
-    if (this.pos < this.src.length) this.pos++; // ')'
+    if (this.pos < this.src.length) this.pos++;
   }
 
   writeValue(): void {
@@ -380,7 +434,6 @@ class PrettyFmt {
         else this.writeList();
       }
     } else if (c === '"') {
-      // quoted string - copy verbatim
       this.out += src[this.pos++];
       while (this.pos < src.length) {
         const ch = src[this.pos];
@@ -390,7 +443,6 @@ class PrettyFmt {
         if (ch === '"') break;
       }
     } else {
-      // plain value
       while (this.pos < src.length && src[this.pos] !== ',' && src[this.pos] !== ')' && src[this.pos] !== ']') {
         this.out += src[this.pos++];
       }
@@ -399,7 +451,7 @@ class PrettyFmt {
 
   writeList(): void {
     this.out += '[\n';
-    this.pos++; // '['
+    this.pos++;
     this.depth++;
     let first = true;
     while (this.pos < this.src.length && this.src[this.pos] !== ']') {
@@ -412,7 +464,7 @@ class PrettyFmt {
     }
     this.depth--;
     this.out += '\n' + this.indent() + ']';
-    if (this.pos < this.src.length) this.pos++; // ']'
+    if (this.pos < this.src.length) this.pos++;
   }
 
   skipWhitespace(): void {
@@ -431,8 +483,7 @@ class PrettyFmt {
 }
 
 // ---------------------------------------------------------------------------
-// decode(text) → AsonResult
-// Parses the schema embedded in the ASON text itself.
+// decode(text) → AsonResult  [schema is embedded in the text]
 // ---------------------------------------------------------------------------
 
 export function decode(text: string): AsonResult {
@@ -451,7 +502,6 @@ class Decoder {
     while (this.pos < s.length) {
       const c = s[this.pos];
       if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { this.pos++; continue; }
-      // Block comment
       if (c === '/' && this.pos + 1 < s.length && s[this.pos + 1] === '*') {
         this.pos += 2;
         while (this.pos + 1 < s.length && !(s[this.pos] === '*' && s[this.pos + 1] === '/')) this.pos++;
@@ -502,7 +552,6 @@ class Decoder {
     }
   }
 
-  /** Parse {field:type, ...} and return Field array */
   parseSchemaFields(): Field[] {
     const s = this.src;
     if (s[this.pos] !== '{') this.err('expected {');
@@ -516,7 +565,6 @@ class Decoder {
         this.pos++;
         this.skip();
       }
-      // Field name
       const ns = this.pos;
       while (this.pos < s.length && s[this.pos] !== ':' && s[this.pos] !== ',' && s[this.pos] !== '}' && s[this.pos] !== ' ' && s[this.pos] !== '\t') this.pos++;
       const name = s.slice(ns, this.pos);
@@ -526,7 +574,6 @@ class Decoder {
       if (this.pos < s.length && s[this.pos] === ':') {
         this.pos++;
         this.skip();
-        // Skip nested structures
         if (this.pos < s.length && (s[this.pos] === '{' || s[this.pos] === '[')) {
           const open = s[this.pos]; const close = open === '{' ? '}' : ']';
           let depth = 0;
@@ -555,9 +602,7 @@ class Decoder {
     const obj: AsonObj = {};
     for (let i = 0; i < fields.length; i++) {
       this.skip();
-      // End of tuple (source has fewer fields than schema)
       if (this.pos >= s.length || s[this.pos] === ')') {
-        // Set remaining optional fields to null
         for (let j = i; j < fields.length; j++) {
           if (fields[j]!.optional) obj[fields[j]!.name] = null;
         }
@@ -569,7 +614,6 @@ class Decoder {
         this.skip();
       }
       const f = fields[i]!;
-      // Optional: if at ',' or ')' the value is absent → null
       if (f.optional && (this.pos >= s.length || s[this.pos] === ',' || s[this.pos] === ')')) {
         obj[f.name] = null;
         continue;
@@ -582,14 +626,13 @@ class Decoder {
   }
 
   parseValue(base: BaseType): unknown {
-    const s = this.src;
     this.skip();
     switch (base) {
-      case 'bool': return this.parseBool();
-      case 'int':  return this.parseInt();
-      case 'uint': return this.parseUint();
+      case 'bool':  return this.parseBool();
+      case 'int':   return this.parseInt();
+      case 'uint':  return this.parseUint();
       case 'float': return this.parseFloat();
-      case 'str':  return this.parseString();
+      case 'str':   return this.parseString();
     }
   }
 
@@ -646,30 +689,26 @@ class Decoder {
   parseString(): string {
     const s = this.src;
     if (s[this.pos] === '"') return this.parseQuotedString();
-    // Plain value: read until delimiter
     const start = this.pos;
     while (this.pos < s.length && s[this.pos] !== ',' && s[this.pos] !== ')' && s[this.pos] !== ']') {
       if (s[this.pos] === '\\') this.pos += 2;
       else this.pos++;
     }
-    // Handle escape sequences in plain string
     const raw = s.slice(start, this.pos);
     if (raw.includes('\\')) return unescapePlain(raw);
     return raw;
   }
 
   parseQuotedString(): string {
-    this.pos++; // skip opening '"'
+    this.pos++;
     const s = this.src;
     const start = this.pos;
-    // Fast path: scan for closing " with no escape
     let scan = this.pos;
     while (scan < s.length && s[scan] !== '"' && s[scan] !== '\\') scan++;
     if (scan < s.length && s[scan] === '"') {
       this.pos = scan + 1;
       return s.slice(start, scan);
     }
-    // Slow path: has escapes — collect segments
     const parts: string[] = [];
     if (scan > start) parts.push(s.slice(start, scan));
     this.pos = scan;
@@ -683,7 +722,6 @@ class Decoder {
         else if (e === 't') parts.push('\t');
         else parts.push(e);
       } else {
-        // Batch non-escape run
         const rs = this.pos;
         while (this.pos < s.length && s[this.pos] !== '"' && s[this.pos] !== '\\') this.pos++;
         parts.push(s.slice(rs, this.pos));
@@ -708,26 +746,27 @@ function unescapePlain(s: string): string {
 
 // ---------------------------------------------------------------------------
 // Binary encode/decode
-// Schema-driven; layout matches ason-rs and ason-go.
 //
-// int   → 8 bytes i64 LE
-// uint  → 8 bytes u64 LE
-// float → 8 bytes f64 LE
-// bool  → 1 byte (0/1)
-// str   → 4-byte length LE + UTF-8 bytes
-// opt?  → 1-byte tag (0=null, 1=present) + value if present
-// slice → 4-byte count LE + each element
+// encodeBinary(obj)             — schema inferred internally, not exposed
+// decodeBinary(data, schema)    — schema string still required (binary has no embedded types)
+//
+// Wire format (LE):
+//   int   → 8 bytes i64
+//   uint  → 8 bytes u64
+//   float → 8 bytes f64
+//   bool  → 1 byte (0/1)
+//   str   → 4-byte length + UTF-8 bytes
+//   opt?  → 1-byte tag (0=null, 1=present) + value if present
+//   slice → 4-byte count + each element
 // ---------------------------------------------------------------------------
 
-const encoder = new TextEncoder();
-const decoder_utf8 = new TextDecoder();
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
-// Reusable ArrayBuffer + DataView for float encoding (avoids per-float allocation)
 const _f64Buf = new ArrayBuffer(8);
 const _f64View = new DataView(_f64Buf);
 const _f64Bytes = new Uint8Array(_f64Buf);
 
-// Growable binary buffer — avoids number[] + per-element push
 class BinWriter {
   buf: Uint8Array;
   len: number;
@@ -757,13 +796,11 @@ class BinWriter {
   pushI64LE(v: number | bigint): void {
     this.grow(8);
     if (typeof v === 'number' && v >= -2147483648 && v <= 2147483647) {
-      // Safe 32-bit int fast path — avoid BigInt
       const iv = v | 0;
       this.buf[this.len++] = iv & 0xFF;
       this.buf[this.len++] = (iv >> 8) & 0xFF;
       this.buf[this.len++] = (iv >> 16) & 0xFF;
       this.buf[this.len++] = (iv >> 24) & 0xFF;
-      // sign-extend high 4 bytes
       const sign = iv < 0 ? 0xFF : 0;
       this.buf[this.len++] = sign;
       this.buf[this.len++] = sign;
@@ -799,7 +836,7 @@ class BinWriter {
   }
 }
 
-function writeBinValueW(w: BinWriter, val: unknown, f: Field): void {
+function writeBinValue(w: BinWriter, val: unknown, f: Field): void {
   if (f.optional) {
     if (val === null || val === undefined) { w.push(0); return; }
     w.push(1);
@@ -810,7 +847,7 @@ function writeBinValueW(w: BinWriter, val: unknown, f: Field): void {
     case 'uint':  w.pushI64LE(val as number | bigint); break;
     case 'float': w.pushF64LE(Number(val)); break;
     case 'str': {
-      const bytes = encoder.encode(String(val));
+      const bytes = textEncoder.encode(String(val));
       w.pushU32LE(bytes.length);
       w.pushBytes(bytes);
       break;
@@ -818,49 +855,41 @@ function writeBinValueW(w: BinWriter, val: unknown, f: Field): void {
   }
 }
 
-export function encodeBinary(obj: AsonResult, schema: string): Uint8Array {
-  const { fields, isSlice } = parseSchema(schema);
-  const rows = Array.isArray(obj) ? obj.length : 1;
-  const w = new BinWriter(rows * fields.length * 16 + 16);
-
+/** encodeBinary(obj) — schema is inferred internally */
+export function encodeBinary(obj: AsonResult): Uint8Array {
   if (Array.isArray(obj)) {
+    const fields = obj.length > 0 ? inferFields(obj[0]!) : [];
+    const w = new BinWriter(obj.length * fields.length * 16 + 16);
     w.pushU32LE(obj.length);
     for (const row of obj) {
-      for (const f of fields) writeBinValueW(w, row[f.name], f);
+      for (const f of fields) writeBinValue(w, row[f.name], f);
     }
+    return w.finish();
   } else {
-    for (const f of fields) writeBinValueW(w, (obj as AsonObj)[f.name], f);
+    const o = obj as AsonObj;
+    const fields = inferFields(o);
+    const w = new BinWriter(fields.length * 16 + 16);
+    for (const f of fields) writeBinValue(w, o[f.name], f);
+    return w.finish();
   }
-
-  return w.finish();
 }
 
-// Read helpers
+// ---------------------------------------------------------------------------
+// decodeBinary(data, schema) — schema must be explicit (binary has no types embedded)
+// ---------------------------------------------------------------------------
+
 function readI64LE(dv: DataView, pos: number): number {
   const lo = dv.getUint32(pos, true);
   const hi = dv.getInt32(pos + 4, true);
   const big = (BigInt(hi) << 32n) | BigInt(lo);
-  // Return as number if fits in safe range, else bigint cast
-  if (big >= BigInt(Number.MIN_SAFE_INTEGER) && big <= BigInt(Number.MAX_SAFE_INTEGER)) {
-    return Number(big);
-  }
-  return Number(big); // best effort for large values; for exactness use BigInt
+  return Number(big);
 }
 
 function readU64LE(dv: DataView, pos: number): number {
   const lo = dv.getUint32(pos, true);
   const hi = dv.getUint32(pos + 4, true);
   const big = (BigInt(hi) << 32n) | BigInt(lo);
-  if (big <= BigInt(Number.MAX_SAFE_INTEGER)) return Number(big);
   return Number(big);
-}
-
-function readF64LE(dv: DataView, pos: number): number {
-  return dv.getFloat64(pos, true);
-}
-
-function readU32LE(dv: DataView, pos: number): number {
-  return dv.getUint32(pos, true);
 }
 
 class BinDecoder {
@@ -883,12 +912,12 @@ class BinDecoder {
       case 'bool':  return this.dv.getUint8(this.pos++) !== 0;
       case 'int':   { const v = readI64LE(this.dv, this.pos); this.pos += 8; return v; }
       case 'uint':  { const v = readU64LE(this.dv, this.pos); this.pos += 8; return v; }
-      case 'float': { const v = readF64LE(this.dv, this.pos); this.pos += 8; return v; }
+      case 'float': { const v = this.dv.getFloat64(this.pos, true); this.pos += 8; return v; }
       case 'str': {
-        const len = readU32LE(this.dv, this.pos); this.pos += 4;
+        const len = this.dv.getUint32(this.pos, true); this.pos += 4;
         const bytes = new Uint8Array(this.dv.buffer, this.dv.byteOffset + this.pos, len);
         this.pos += len;
-        return decoder_utf8.decode(bytes);
+        return textDecoder.decode(bytes);
       }
     }
   }
@@ -900,7 +929,7 @@ export function decodeBinary(data: Uint8Array, schema: string): AsonResult {
 
   let result: AsonResult;
   if (isSlice) {
-    const count = readU32LE(bd.dv, bd.pos); bd.pos += 4;
+    const count = bd.dv.getUint32(bd.pos, true); bd.pos += 4;
     const rows: AsonObj[] = [];
     for (let i = 0; i < count; i++) rows.push(bd.readStruct(fields));
     result = rows;

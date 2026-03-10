@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![npm](https://img.shields.io/badge/npm-ason--js-blue)](https://www.npmjs.com/package/ason-js)
 
-零依赖 JavaScript/TypeScript 库，用于 **ASON**（Array-Schema Object Notation）—— 一种面向 LLM 交互和大规模数据传输的 token 高效、模式驱动数据格式。
+零依赖 JavaScript/TypeScript 库，用于 **ASON**（Array-Schema Object Notation）—— 一种面向 LLM 交互和大规模数据传输的 token 高效数据格式。
 
 `ason-js` 是官方的 JS/TS 运行时包，同时适用于 JavaScript 和 TypeScript 用户。它在一个包内同时提供 ESM/CJS 构建产物和 `.d.ts` 类型声明，因此不需要再单独安装 `ason-ts`。
 
@@ -50,75 +50,98 @@ TypeScript 用户不需要单独安装 stub 包。`npm run build` 会生成 `dis
 ## 快速开始
 
 ```ts
-import { encode, decode, encodePretty, encodeBinary, decodeBinary } from 'ason-js';
+import { encode, encodeTyped, encodePretty, encodePrettyTyped,
+         decode, encodeBinary, decodeBinary } from 'ason-js';
 
 const users = [
   { id: 1, name: 'Alice', score: 9.5 },
   { id: 2, name: 'Bob',   score: 7.2 },
 ];
-const schema = '[{id:int, name:str, score:float}]';
 
-const text   = encode(users, schema);
-const pretty = encodePretty(users, schema);
-const blob   = encodeBinary(users, schema);
+// schema 自动推断——不需要手动传 schema 字符串
+const text        = encode(users);           // 无类型 schema（更短）
+const textTyped   = encodeTyped(users);      // 有类型 schema（推荐用于 round-trip）
+const pretty      = encodePretty(users);     // pretty + 无类型
+const prettyTyped = encodePrettyTyped(users);// pretty + 有类型
+const blob        = encodeBinary(users);     // 二进制（schema 内部推断）
 
-console.log(decode(text));               // 还原原始数组
-console.log(decode(pretty));             // 从美化文本还原
-console.log(decodeBinary(blob, schema)); // 从二进制还原
+console.log(decode(textTyped));              // 还原原始数组（类型完整）
+console.log(decode(prettyTyped));            // 从美化文本还原
+console.log(decodeBinary(blob, '[{id:int, name:str, score:float}]')); // 从二进制还原
 ```
+
+> **`encode` 与 `encodeTyped` 的区别**
+> `encode(obj)` 输出无类型 schema（`{id,name}`），文本更短，但 `decode` 后所有值都是字符串。
+> `encodeTyped(obj)` 输出有类型 schema，适合需要保真 round-trip 的场景。
+> `decodeBinary` 仍需传入 schema 字符串，因为二进制格式不嵌入类型信息。
 
 ---
 
 ## API
 
+### 类型推断规则
+
+| JS 值 | 推断 ASON 类型 |
+|-------|--------------|
+| 整数 `number` | `int` |
+| 小数 `number` | `float` |
+| `boolean` | `bool` |
+| `string` | `str` |
+| `null` / `undefined` | `str?`（可选） |
+
+> **注意：** Schema 从数组的**第一个元素**推断。要让字段成为可选（`str?`），需要在第一个元素中将该字段设为 `null`。
+
+### `encode(obj) → string` — 无类型 schema，自动推断
+
+将对象或对象数组序列化为 ASON 文本，输出**无类型**（更短）的 schema。
+解码时所有值都第**字符串**形式返回（因为无类型 schema 不含类型信息）：
+
 ```ts
-// Schema（模式）字符串格式：
-//   单个结构体："{field:type, ...}"
-//   结构体切片："[{field:type, ...}]"
-//
-// 类型：int  uint  float  bool  str
-// 可选：在类型后加 '?'  →  str?  int?  float?  ...
+encode({ id: 1, name: 'Alice' });
+// → '{id,name}:\n(1,Alice)\n'
+
+encode([{ id: 1 }, { id: 2 }]);
+// → '[{id}]:\n(1),\n(2)\n'
+
+decode(encode({ id: 1, name: 'Alice' }));
+// → { id: '1', name: 'Alice' }  ← 无类型 schema 下所有值都是字符串
 ```
 
-### `encode(obj, schema) → string`
+如需 `decode` 还原原始类型，请使用 `encodeTyped`。
 
-将 JS 对象或对象数组序列化为 ASON 文本：
+### `encodeTyped(obj) → string` — 有类型 schema，自动推断
+
+同上但输出**有类型**的 schema，decode 后能完整还原类型：
 
 ```ts
-const text = encode({ id: 1, name: 'Alice' }, '{id:int, name:str}');
-// → '{id:int, name:str}:\n(1,Alice)\n'
-
-const text2 = encode(rows, '[{id:int, name:str}]');
+encodeTyped({ id: 1, name: 'Alice', active: true });
+// → '{id:int,name:str,active:bool}:\n(1,Alice,true)\n'
 ```
+
+### `encodePretty(obj) → string` — pretty + 无类型
+
+### `encodePrettyTyped(obj) → string` — pretty + 有类型
 
 ### `decode(text) → object | object[]`
 
-将 ASON 文本反序列化为 JS 对象或数组：
+将 ASON 文本反序列化为 JS 对象或数组（schema 嵌入在文本中）：
 
 ```ts
 const rec  = decode('{id:int, name:str}:\n(1,Alice)\n');
 const rows = decode('[{id:int, name:str}]:\n(1,Alice),\n(2,Bob)\n');
 ```
 
-### `encodePretty(obj, schema) → string`
+### `encodeBinary(obj) → Uint8Array` — schema 内部推断
 
-序列化为带缩进的多行 ASON 文本，便于阅读：
-
-```ts
-const pretty = encodePretty(rows, '[{id:int, name:str}]');
-```
-
-### `encodeBinary(obj, schema) → Uint8Array`
-
-序列化为二进制格式（与 ason-rs、ason-go 字节级兼容）：
+将对象序列化为二进制格式，**不需要传 schema 字符串**：
 
 ```ts
-const data = encodeBinary(rows, '[{id:int, name:str}]');
+const data = encodeBinary(rows);
 ```
 
 ### `decodeBinary(data, schema) → object | object[]`
 
-从二进制格式反序列化：
+从二进制格式反序列化。**必须传 schema**，因为二进制 wire format 不嵌入类型信息：
 
 ```ts
 const rows = decodeBinary(data, '[{id:int, name:str}]');
@@ -146,7 +169,7 @@ const rows = decodeBinary(data, '[{id:int, name:str}]');
 ```html
 <script src="dist/ason.min.js"></script>
 <script>
-  const text = ASON.encode([{id:1, name:'Alice'}], '[{id:int, name:str}]');
+  const text = ASON.encodeTyped([{id:1, name:'Alice'}]);
   console.log(ASON.decode(text));
 </script>
 ```
@@ -155,8 +178,8 @@ const rows = decodeBinary(data, '[{id:int, name:str}]');
 
 ```html
 <script type="module">
-  import { encode, decode } from './dist/index.js';
-  const text = encode([{id:1, name:'Alice'}], '[{id:int, name:str}]');
+  import { encodeTyped, decode } from './dist/index.js';
+  const text = encodeTyped([{id:1, name:'Alice'}]);
   console.log(decode(text));
 </script>
 ```
@@ -167,23 +190,23 @@ const rows = decodeBinary(data, '[{id:int, name:str}]');
 
 ```ts
 // Vue composable 示例
-import { encode, decode } from 'ason-js';
+import { encodeTyped, decode } from 'ason-js';
 
-export function useAson(schema: string) {
-  const serialize = (data: object[]) => encode(data, schema);
-  const deserialize = (text: string) => decode(text);
+export function useAson() {
+  const serialize   = (data: object[]) => encodeTyped(data);
+  const deserialize = (text: string)   => decode(text);
   return { serialize, deserialize };
 }
 
 // React hook 示例
 import { useMemo } from 'react';
-import { encode, decode } from 'ason-js';
+import { encodeTyped, decode } from 'ason-js';
 
-export function useAsonCodec(schema: string) {
+export function useAsonCodec() {
   return useMemo(() => ({
-    encode: (data: object[]) => encode(data, schema),
-    decode: (text: string) => decode(text),
-  }), [schema]);
+    encode: (data: object[]) => encodeTyped(data),
+    decode: (text: string)   => decode(text),
+  }), []);
 }
 ```
 
@@ -210,7 +233,7 @@ export function useAsonCodec(schema: string) {
 ```bash
 npm install
 npm run build    # 生成 dist/index.js、dist/index.cjs、dist/index.d.ts、dist/ason.min.js
-npm test         # vitest，40 个测试
+npm test         # vitest，46 个测试
 ```
 
 ---
@@ -247,10 +270,10 @@ MIT
 
 ## Latest Benchmarks
 
-在当前机器上使用 Node `24.14.0` 实测：
+在当前机器上使用 Node `24.14.0` 实测（全部使用新推断驱动 API）：
 
-- 扁平 1,000 条记录：ASON 文本 `58,539 B`，JSON `121,451 B`，缩小 `51.8%`
-- 扁平 5,000 条记录：ASON 序列化 `8.93ms`，JSON `13.27ms`；但反序列化 ASON `20.10ms`，JSON `16.92ms`
-- 大载荷 10,000 条记录：ASON 序列化 `37.86ms`，JSON `20.23ms`；反序列化 ASON `37.25ms`，JSON `33.82ms`
+- 扁平 1,000 条记录：ASON typed 文本 `58,539 B`，JSON `121,451 B`，缩小 `51.8%`
+- 扁平 5,000 条记录：ASON typed 序列化 `8.93ms`，JSON `13.27ms`
+- 大载荷 10,000 条记录：ASON typed 序列化 `37.86ms`，JSON `20.23ms`
 - 这轮测试中 JS 版的主要优势仍然是体积和 token 节省，不是全面压过原生 JSON 的绝对速度
 - 二进制路径更偏向传输和解码场景：1,000 条记录时 BIN 体积 `72,784 B`，JSON `121,451 B`
