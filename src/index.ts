@@ -89,7 +89,7 @@ function inferStructTypeExpr(sample: AsonObj): string {
     const value = sample[name];
     const optional = value === null || value === undefined;
     const typeExpr = optional ? 'str' : inferValueTypeExpr(value);
-    return `${name}@${optional ? `${typeExpr}?` : typeExpr}`;
+    return `${encodeSchemaFieldName(name)}@${optional ? `${typeExpr}?` : typeExpr}`;
   });
   return `{${parts.join(',')}}`;
 }
@@ -197,13 +197,20 @@ function scanStructSchema(src: string, start: number): { fields: Field[]; end: n
       skip();
     }
 
-    const ns = pos;
-    while (pos < n && src[pos] !== '@' && src[pos] !== ',' && src[pos] !== '}' && src[pos] !== ':' &&
-      src[pos] !== ' ' && src[pos] !== '\t' && src[pos] !== '\n' && src[pos] !== '\r') {
-      pos++;
+    let name = '';
+    if (src[pos] === '"') {
+      const parsed = parseSchemaQuotedName(src, pos);
+      name = parsed.name;
+      pos = parsed.end;
+    } else {
+      const ns = pos;
+      while (pos < n && src[pos] !== '@' && src[pos] !== ',' && src[pos] !== '}' && src[pos] !== ':' &&
+        src[pos] !== ' ' && src[pos] !== '\t' && src[pos] !== '\n' && src[pos] !== '\r') {
+        pos++;
+      }
+      name = src.slice(ns, pos);
+      if (!name) throw new AsonError(`empty field name in schema`);
     }
-    const name = src.slice(ns, pos);
-    if (!name) throw new AsonError(`empty field name in schema`);
 
     skip();
     let typeExpr = 'str';
@@ -224,6 +231,35 @@ function scanStructSchema(src: string, start: number): { fields: Field[]; end: n
   }
 
   return { fields, end: pos };
+}
+
+function parseSchemaQuotedName(src: string, start: number): { name: string; end: number } {
+  let pos = start + 1;
+  const parts: string[] = [];
+  while (pos < src.length) {
+    const c = src[pos]!;
+    if (c === '"') {
+      return { name: parts.join(''), end: pos + 1 };
+    }
+    if (c === '\\') {
+      pos++;
+      if (pos >= src.length) throw new AsonError(`unterminated quoted field name in schema`);
+      const esc = src[pos]!;
+      if (esc === '"') parts.push('"');
+      else if (esc === '\\') parts.push('\\');
+      else if (esc === 'n') parts.push('\n');
+      else if (esc === 'r') parts.push('\r');
+      else if (esc === 't') parts.push('\t');
+      else if (esc === 'b') parts.push('\b');
+      else if (esc === 'f') parts.push('\f');
+      else parts.push(esc);
+      pos++;
+      continue;
+    }
+    parts.push(c);
+    pos++;
+  }
+  throw new AsonError(`unterminated quoted field name in schema`);
 }
 
 function scanBalanced(src: string, start: number, open: string, close: string): number {
@@ -285,11 +321,12 @@ function typeExprToUntyped(typeExpr: string): string | null {
 }
 
 function renderFieldHeader(field: Field, typed: boolean): string {
+  const name = encodeSchemaFieldName(field.name);
   if (typed) {
-    return `${field.name}@${field.typeExpr}${field.optional ? '?' : ''}`;
+    return `${name}@${field.typeExpr}${field.optional ? '?' : ''}`;
   }
   const nested = typeExprToUntyped(field.optional ? `${field.typeExpr}?` : field.typeExpr);
-  return nested ? `${field.name}@${nested}` : field.name;
+  return nested ? `${name}@${nested}` : name;
 }
 
 function buildHeader(fields: Field[], isSlice: boolean, typed: boolean): string {
@@ -310,6 +347,46 @@ function needsQuoting(s: string): boolean {
     if (couldBeNum && i >= numStart && !((c >= 48 && c <= 57) || c === 46)) couldBeNum = false;
   }
   return couldBeNum && s.length > numStart;
+}
+
+function needsQuotedSchemaFieldName(name: string): boolean {
+  if (name.length === 0) return true;
+  if (name === 'true' || name === 'false') return true;
+  if (name[0] === ' ' || name[name.length - 1] === ' ') return true;
+  let couldBeNum = true;
+  const numStart = name[0] === '-' ? 1 : 0;
+  if (numStart >= name.length) couldBeNum = false;
+  for (let i = 0; i < name.length; i++) {
+    const c = name.charCodeAt(i);
+    if (
+      c < 32 ||
+      c === 32 ||
+      c === 9 ||
+      c === 10 ||
+      c === 13 ||
+      c === 44 ||
+      c === 64 ||
+      c === 58 ||
+      c === 123 ||
+      c === 125 ||
+      c === 91 ||
+      c === 93 ||
+      c === 40 ||
+      c === 41 ||
+      c === 34 ||
+      c === 92
+    ) {
+      return true;
+    }
+    if (couldBeNum && i >= numStart && !((c >= 48 && c <= 57) || c === 46)) {
+      couldBeNum = false;
+    }
+  }
+  return couldBeNum && name.length > numStart;
+}
+
+function encodeSchemaFieldName(name: string): string {
+  return needsQuotedSchemaFieldName(name) ? quoteStr(name) : name;
 }
 
 function quoteStr(s: string): string {

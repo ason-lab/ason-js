@@ -5,6 +5,7 @@ import {
   decodeBinary,
   encode,
   encodeBinary,
+  encodePretty,
   encodePrettyTyped,
   encodeTyped,
 } from '../src/index.js';
@@ -28,6 +29,12 @@ describe('header generation', () => {
       members: [{ id: 1, role: 'owner' }],
     });
     expect(text).toMatch(/^\{name,profile@\{host,port\},tags@\[\],members@\[\{id,role\}\]\}:/);
+  });
+
+  it('quotes schema field names with spaces, numeric strings, and specials', () => {
+    const text = encodeTyped({ 'id uuid': 1, '65': 'Alice', '{}[]@"': true });
+    expect(text).toBe('{"65"@str,"id uuid"@int,"{}[]@\\\""@bool}:\n(Alice,1,true)\n');
+    expect(decode(text)).toEqual({ 'id uuid': 1, '65': 'Alice', '{}[]@"': true });
   });
 });
 
@@ -143,6 +150,12 @@ describe('binary roundtrip', () => {
     padded[data.length] = 0xff;
     expect(() => decodeBinary(padded, '{x@int}')).toThrow(AsonError);
   });
+
+  it('roundtrips binary with quoted schema field names', () => {
+    const row = { 'id uuid': 1, '65': 'Alice', '{}[]@"': true };
+    const schema = '{"65"@str,"id uuid"@int,"{}[]@\\\""@bool}';
+    expect(decodeBinary(encodeBinary(row), schema)).toEqual(row);
+  });
 });
 
 describe('legacy syntax rejection', () => {
@@ -170,5 +183,20 @@ describe('scale sanity', () => {
     const decoded = decode(encodeTyped(rows)) as typeof rows;
     expect(decoded).toHaveLength(1000);
     expect(decoded[999]).toEqual(rows[999]);
+  });
+});
+
+describe('quoted schema field names', () => {
+  it('roundtrips across encode variants', () => {
+    const row = { 'id uuid': 1, '65': 'Alice', '{}[]@"': true };
+    expect(decode(encode(row))).toEqual({ 'id uuid': '1', '65': 'Alice', '{}[]@"': 'true' });
+    expect(decode(encodePretty(row))).toEqual({ 'id uuid': '1', '65': 'Alice', '{}[]@"': 'true' });
+    expect(decode(encodeTyped(row))).toEqual(row);
+    expect(decode(encodePrettyTyped(row))).toEqual(row);
+  });
+
+  it('decodes explicit quoted schema names', () => {
+    const text = '{"id uuid"@int,"65"@str,"{}[]@\\\""@bool}:\n(1,Alice,true)\n';
+    expect(decode(text)).toEqual({ 'id uuid': 1, '65': 'Alice', '{}[]@"': true });
   });
 });
