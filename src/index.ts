@@ -37,7 +37,7 @@ interface ParsedSchema {
 
 const NEEDS_QUOTE = new Uint8Array(256);
 for (let i = 0; i < 32; i++) NEEDS_QUOTE[i] = 1;
-for (const ch of [',', '(', ')', '[', ']', '"', '\\']) {
+for (const ch of [',', '@', '(', ')', '[', ']', '"', '\\']) {
   NEEDS_QUOTE[ch.charCodeAt(0)] = 1;
 }
 

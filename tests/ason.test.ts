@@ -112,6 +112,16 @@ describe('string handling', () => {
     const obj = { message: 'line1\nline2\tok' };
     expect(decode(encodeTyped(obj))).toEqual(obj);
   });
+
+  it('quotes string values containing @ across APIs', () => {
+    const obj = { message: '@Alice' };
+    expect(encode(obj)).toContain('"@Alice"');
+    expect(decode(encode(obj))).toEqual(obj);
+    expect(decode(encodeTyped(obj))).toEqual(obj);
+    expect(decode(encodePretty(obj))).toEqual(obj);
+    expect(decode(encodePrettyTyped(obj))).toEqual(obj);
+    expect(decodeBinary(encodeBinary(obj), '{message@str}')).toEqual(obj);
+  });
 });
 
 describe('binary roundtrip', () => {
