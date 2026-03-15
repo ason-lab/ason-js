@@ -1,39 +1,27 @@
 /**
- * ASON (Array-Schema Object Notation) — JavaScript/TypeScript library.
- *
- * Zero dependencies. Works in browsers, Node.js, Deno, Bun.
- * Compatible with Vue, React, Svelte, SolidJS, and any JS framework.
+ * ASON (Array-Schema Object Notation) — JavaScript/TypeScript runtime.
  *
  * API:
- *   encode(obj)                    → string   (untyped schema, inferred)
- *   encodeTyped(obj)               → string   (typed schema, inferred)
- *   encodePretty(obj)              → string   (pretty + untyped schema)
- *   encodePrettyTyped(obj)         → string   (pretty + typed schema)
+ *   encode(obj)                    → string
+ *   encodeTyped(obj)               → string
+ *   encodePretty(obj)              → string
+ *   encodePrettyTyped(obj)         → string
  *   decode(text)                   → object | object[]
- *   encodeBinary(obj)              → Uint8Array (schema inferred internally)
+ *   encodeBinary(obj)              → Uint8Array
  *   decodeBinary(data, schema)     → object | object[]
  *
- * Type inference rules (matches ason-go / ason-rs / ason-java behaviour):
- *   JS number (integer)  → int
- *   JS number (fraction) → float
- *   JS boolean           → bool
- *   JS string            → str
- *   null / undefined     → str? (optional str)
- *   Arrays are encoded as schema-once slices.
- *
- * decodeBinary still requires an explicit schema string because the binary
- * format carries no embedded type information. All other APIs are schema-free.
+ * Rules:
+ *   - Text schema uses `@` type annotations.
+ *   - Complex fields must keep `@{...}` / `@[...]` structural markers.
+ *   - Legacy `<k:v>` map syntax is not supported.
+ *   - Binary decode still requires an explicit schema because binary payloads
+ *     do not embed type information.
  */
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
 
 export type AsonObj = Record<string, unknown>;
 export type AsonResult = AsonObj | AsonObj[];
 
-type BaseType = 'int' | 'uint' | 'float' | 'bool' | 'str' | 'map' | 'list' | 'struct';
-type FieldType = BaseType | `${BaseType}?` | string;
+type BaseType = 'int' | 'uint' | 'float' | 'bool' | 'str' | 'list' | 'struct';
 
 interface Field {
   name: string;
@@ -47,36 +35,47 @@ interface ParsedSchema {
   isSlice: boolean;
 }
 
-// ---------------------------------------------------------------------------
-// Character tables
-// ---------------------------------------------------------------------------
-
 const NEEDS_QUOTE = new Uint8Array(256);
 for (let i = 0; i < 32; i++) NEEDS_QUOTE[i] = 1;
 for (const ch of [',', '(', ')', '[', ']', '"', '\\']) {
   NEEDS_QUOTE[ch.charCodeAt(0)] = 1;
 }
 
-// ---------------------------------------------------------------------------
-// Type inference: derive field list from an object
-// ---------------------------------------------------------------------------
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+const _f64Buf = new ArrayBuffer(8);
+const _f64View = new DataView(_f64Buf);
+const _f64Bytes = new Uint8Array(_f64Buf);
+
+const _schemaCache = new Map<string, ParsedSchema>();
+
+function isPlainObject(value: unknown): value is AsonObj {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
 function inferBaseType(val: unknown): BaseType {
   if (typeof val === 'boolean') return 'bool';
-  if (typeof val === 'number') {
-    return Number.isInteger(val) ? 'int' : 'float';
-  }
+  if (typeof val === 'number') return Number.isInteger(val) ? 'int' : 'float';
   if (typeof val === 'bigint') return 'int';
   if (Array.isArray(val)) return 'list';
-  if (typeof val === 'object' && val !== null && !Array.isArray(val)) return 'map';
+  if (isPlainObject(val)) return 'struct';
   return 'str';
 }
 
 function baseTypeFromExpr(typeExpr: string): BaseType {
-  if (typeExpr.startsWith('<')) return 'map';
   if (typeExpr.startsWith('[')) return 'list';
   if (typeExpr.startsWith('{')) return 'struct';
-  return typeExpr as BaseType;
+  if (typeExpr === 'int' || typeExpr === 'uint' || typeExpr === 'float' || typeExpr === 'bool' || typeExpr === 'str') {
+    return typeExpr;
+  }
+  throw new AsonError(`unknown type '${typeExpr}'`);
+}
+
+function stripOptional(typeExpr: string): { inner: string; optional: boolean } {
+  return typeExpr.endsWith('?')
+    ? { inner: typeExpr.slice(0, -1), optional: true }
+    : { inner: typeExpr, optional: false };
 }
 
 function unifyTypeExpr(a: string, b: string): string {
@@ -86,13 +85,13 @@ function unifyTypeExpr(a: string, b: string): string {
 }
 
 function inferStructTypeExpr(sample: AsonObj): string {
-  const fields = Object.keys(sample).map(name => {
-    const val = sample[name];
-    const optional = val === null || val === undefined;
-    const typeExpr = optional ? 'str' : inferValueTypeExpr(val);
-    return `${name}:${optional ? `${typeExpr}?` : typeExpr}`;
+  const parts = Object.keys(sample).map(name => {
+    const value = sample[name];
+    const optional = value === null || value === undefined;
+    const typeExpr = optional ? 'str' : inferValueTypeExpr(value);
+    return `${name}@${optional ? `${typeExpr}?` : typeExpr}`;
   });
-  return `{${fields.join(',')}}`;
+  return `{${parts.join(',')}}`;
 }
 
 function inferValueTypeExpr(val: unknown): string {
@@ -110,9 +109,7 @@ function inferValueTypeExpr(val: unknown): string {
         optional = true;
         continue;
       }
-      const cur = typeof item === 'object' && item !== null && !Array.isArray(item)
-        ? inferStructTypeExpr(item as AsonObj)
-        : inferValueTypeExpr(item);
+      const cur = inferValueTypeExpr(item);
       elemExpr = hasNonNull ? unifyTypeExpr(elemExpr, cur) : cur;
       hasNonNull = true;
     }
@@ -120,122 +117,51 @@ function inferValueTypeExpr(val: unknown): string {
     if (optional && !elemExpr.endsWith('?')) elemExpr += '?';
     return `[${elemExpr}]`;
   }
-  if (typeof val === 'object') {
-    const values = Object.values(val as Record<string, unknown>);
-    let valueExpr = 'str';
-    let hasNonNull = false;
-    let optional = false;
-    for (const item of values) {
-      if (item === null || item === undefined) {
-        optional = true;
-        continue;
-      }
-      const cur = inferValueTypeExpr(item);
-      valueExpr = hasNonNull ? unifyTypeExpr(valueExpr, cur) : cur;
-      hasNonNull = true;
-    }
-    if (!hasNonNull) valueExpr = 'str';
-    if (optional && !valueExpr.endsWith('?')) valueExpr += '?';
-    return `<str:${valueExpr}>`;
-  }
+  if (isPlainObject(val)) return inferStructTypeExpr(val);
   return 'str';
 }
 
-/** Infer a Field array from a sample object (or the first element of an array). */
 function inferFields(sample: AsonObj): Field[] {
   return Object.keys(sample).map(name => {
-    const val = sample[name];
-    const optional = val === null || val === undefined;
-    const typeExpr = optional ? 'str' : inferValueTypeExpr(val);
-    const base: BaseType = baseTypeFromExpr(typeExpr);
-    return { name, base, optional, typeExpr };
+    const value = sample[name];
+    const optional = value === null || value === undefined;
+    const typeExpr = optional ? 'str' : inferValueTypeExpr(value);
+    return {
+      name,
+      base: baseTypeFromExpr(stripOptional(typeExpr).inner),
+      optional,
+      typeExpr,
+    };
   });
 }
-
-/** Build an untyped schema header string, e.g. "{id,name,active}" or "[{...}]" */
-function buildUntypedHeader(fields: Field[], isSlice: boolean): string {
-  const inner = '{' + fields.map(f => f.name).join(',') + '}';
-  return isSlice ? '[' + inner + ']' : inner;
-}
-
-/** Build a typed schema header string, e.g. "{id:int,name:str,active:bool}" */
-function buildTypedHeader(fields: Field[], isSlice: boolean): string {
-  const inner = '{' + fields.map(f => {
-    const t: string = f.optional ? f.typeExpr + '?' : f.typeExpr;
-    return f.name + ':' + t;
-  }).join(',') + '}';
-  return isSlice ? '[' + inner + ']' : inner;
-}
-
-// ---------------------------------------------------------------------------
-// Schema parsing (for decodeBinary and decode())
-// ---------------------------------------------------------------------------
-
-const _schemaCache = new Map<string, ParsedSchema>();
 
 function parseSchema(schema: string): ParsedSchema {
   const cached = _schemaCache.get(schema);
   if (cached) return cached;
-  const result = parseSchemaInner(schema);
-  _schemaCache.set(schema, result);
-  return result;
+  const parsed = parseSchemaInner(schema);
+  _schemaCache.set(schema, parsed);
+  return parsed;
 }
 
 function parseSchemaInner(schema: string): ParsedSchema {
   let pos = 0;
   const n = schema.length;
 
-  const skip = () => { while (pos < n && (schema[pos] === ' ' || schema[pos] === '\t')) pos++; };
+  const skip = () => {
+    while (pos < n && (schema[pos] === ' ' || schema[pos] === '\t' || schema[pos] === '\n' || schema[pos] === '\r')) pos++;
+  };
 
   skip();
   let isSlice = false;
-  if (pos < n && schema[pos] === '[') { isSlice = true; pos++; }
+  if (pos < n && schema[pos] === '[') {
+    isSlice = true;
+    pos++;
+  }
 
   skip();
   if (pos >= n || schema[pos] !== '{') throw new AsonError(`expected '{' in schema`);
-  pos++; // consume '{'
-
-  const fields: Field[] = [];
-  while (pos < n) {
-    skip();
-    if (pos >= n) throw new AsonError('unexpected end in schema');
-    if (schema[pos] === '}') { pos++; break; }
-    if (fields.length > 0) {
-      if (schema[pos] !== ',') throw new AsonError(`expected ',' in schema`);
-      pos++;
-      skip();
-    }
-
-    const ns = pos;
-    while (pos < n && schema[pos] !== ':' && schema[pos] !== ',' && schema[pos] !== '}' && schema[pos] !== ' ' && schema[pos] !== '\t') pos++;
-    const name = schema.slice(ns, pos);
-    if (!name) throw new AsonError('empty field name in schema');
-
-    skip();
-
-    let typePart: string = 'str';
-    if (pos < n && schema[pos] === ':') {
-      pos++; // consume ':'
-      skip();
-      if (pos < n && (schema[pos] === '{' || schema[pos] === '[' || schema[pos] === '<')) {
-        const scanned = scanTypeExpr(schema, pos);
-        typePart = scanned.typeExpr;
-        pos = scanned.end;
-      } else {
-        const ts = pos;
-        while (pos < n && schema[pos] !== ',' && schema[pos] !== '}' && schema[pos] !== ' ' && schema[pos] !== '\t') pos++;
-        typePart = schema.slice(ts, pos);
-      }
-    }
-
-    const optional = typePart.endsWith('?');
-    const basePart = optional ? typePart.slice(0, -1) : typePart;
-    const base = (basePart.startsWith('<') ? 'map' : basePart) as BaseType;
-    if (!['int', 'uint', 'float', 'bool', 'str', 'map'].includes(base)) {
-      throw new AsonError(`unknown type '${base}' in schema`);
-    }
-    fields.push({ name, base, optional, typeExpr: basePart });
-  }
+  const scannedStruct = scanStructSchema(schema, pos);
+  pos = scannedStruct.end;
 
   if (isSlice) {
     skip();
@@ -243,12 +169,133 @@ function parseSchemaInner(schema: string): ParsedSchema {
     pos++;
   }
 
-  return { fields, isSlice };
+  skip();
+  if (pos !== n) throw new AsonError(`unexpected trailing schema content`);
+  return { fields: scannedStruct.fields, isSlice };
 }
 
-// ---------------------------------------------------------------------------
-// String quoting helpers
-// ---------------------------------------------------------------------------
+function scanStructSchema(src: string, start: number): { fields: Field[]; end: number } {
+  let pos = start;
+  const n = src.length;
+  if (src[pos] !== '{') throw new AsonError(`expected '{' in schema`);
+  pos++;
+
+  const skip = () => {
+    while (pos < n && (src[pos] === ' ' || src[pos] === '\t' || src[pos] === '\n' || src[pos] === '\r')) pos++;
+  };
+
+  const fields: Field[] = [];
+  while (pos < n) {
+    skip();
+    if (src[pos] === '}') {
+      pos++;
+      break;
+    }
+    if (fields.length > 0) {
+      if (src[pos] !== ',') throw new AsonError(`expected ',' in schema`);
+      pos++;
+      skip();
+    }
+
+    const ns = pos;
+    while (pos < n && src[pos] !== '@' && src[pos] !== ',' && src[pos] !== '}' && src[pos] !== ':' &&
+      src[pos] !== ' ' && src[pos] !== '\t' && src[pos] !== '\n' && src[pos] !== '\r') {
+      pos++;
+    }
+    const name = src.slice(ns, pos);
+    if (!name) throw new AsonError(`empty field name in schema`);
+
+    skip();
+    let typeExpr = 'str';
+    if (pos < n && src[pos] === ':') {
+      throw new AsonError(`legacy ':' type annotations are not supported; use '@'`);
+    }
+    if (pos < n && src[pos] === '@') {
+      pos++;
+      skip();
+      const scanned = scanTypeExpr(src, pos);
+      typeExpr = scanned.typeExpr;
+      pos = scanned.end;
+    }
+
+    const stripped = stripOptional(typeExpr);
+    const base = baseTypeFromExpr(stripped.inner);
+    fields.push({ name, base, optional: stripped.optional, typeExpr: stripped.inner });
+  }
+
+  return { fields, end: pos };
+}
+
+function scanBalanced(src: string, start: number, open: string, close: string): number {
+  let depth = 0;
+  for (let pos = start; pos < src.length; pos++) {
+    const c = src[pos]!;
+    if (c === open) depth++;
+    else if (c === close) {
+      depth--;
+      if (depth === 0) return pos + 1;
+    }
+  }
+  throw new AsonError(`unterminated '${open}${close}' block in schema`);
+}
+
+function scanTypeExpr(src: string, start: number): { typeExpr: string; end: number } {
+  if (start >= src.length) return { typeExpr: 'str', end: start };
+  const c = src[start]!;
+  if (c === '<') throw new AsonError(`legacy map syntax '<...>' is not supported`);
+  if (c === '{') {
+    let end = scanBalanced(src, start, '{', '}');
+    if (src[end] === '?') end++;
+    return { typeExpr: src.slice(start, end), end };
+  }
+  if (c === '[') {
+    let end = scanBalanced(src, start, '[', ']');
+    if (src[end] === '?') end++;
+    return { typeExpr: src.slice(start, end), end };
+  }
+
+  let end = start;
+  while (end < src.length && src[end] !== ',' && src[end] !== '}' &&
+    src[end] !== ' ' && src[end] !== '\t' && src[end] !== '\n' && src[end] !== '\r') {
+    if (src[end] === '<') throw new AsonError(`legacy map syntax '<...>' is not supported`);
+    end++;
+  }
+  return { typeExpr: src.slice(start, end), end };
+}
+
+function typeExprToUntyped(typeExpr: string): string | null {
+  const stripped = stripOptional(typeExpr);
+  const inner = stripped.inner;
+  if (!inner.startsWith('{') && !inner.startsWith('[')) return null;
+
+  if (inner.startsWith('{')) {
+    const fields = parseSchema(inner).fields;
+    const rendered = fields.map(field => {
+      const nested = typeExprToUntyped(field.optional ? `${field.typeExpr}?` : field.typeExpr);
+      const suffix = nested ? `@${nested}` : '';
+      const optional = nested && field.optional ? '?' : '';
+      return `${field.name}${suffix}${optional}`;
+    }).join(',');
+    return `{${rendered}}${stripped.optional ? '?' : ''}`;
+  }
+
+  const innerExpr = inner.slice(1, -1).trim();
+  const nested = innerExpr ? typeExprToUntyped(innerExpr) : null;
+  return `[${nested ?? ''}]${stripped.optional ? '?' : ''}`;
+}
+
+function renderFieldHeader(field: Field, typed: boolean): string {
+  if (typed) {
+    return `${field.name}@${field.typeExpr}${field.optional ? '?' : ''}`;
+  }
+  const nested = typeExprToUntyped(field.optional ? `${field.typeExpr}?` : field.typeExpr);
+  return nested ? `${field.name}@${nested}` : field.name;
+}
+
+function buildHeader(fields: Field[], isSlice: boolean, typed: boolean): string {
+  const inner = `{${fields.map(field => renderFieldHeader(field, typed)).join(',')}}`;
+  return isSlice ? `[${inner}]` : inner;
+}
 
 function needsQuoting(s: string): boolean {
   if (s.length === 0) return true;
@@ -267,17 +314,16 @@ function needsQuoting(s: string): boolean {
 
 function quoteStr(s: string): string {
   const parts: string[] = ['"'];
-  let i = 0;
-  while (i < s.length) {
-    const run = i;
-    while (i < s.length && s[i] !== '"' && s[i] !== '\\' && s[i] !== '\n' && s[i] !== '\t') i++;
-    if (i > run) parts.push(s.slice(run, i));
-    if (i >= s.length) break;
-    const c = s[i++];
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!;
     if (c === '"') parts.push('\\"');
     else if (c === '\\') parts.push('\\\\');
     else if (c === '\n') parts.push('\\n');
+    else if (c === '\r') parts.push('\\r');
     else if (c === '\t') parts.push('\\t');
+    else if (c === '\b') parts.push('\\b');
+    else if (c === '\f') parts.push('\\f');
+    else parts.push(c);
   }
   parts.push('"');
   return parts.join('');
@@ -296,92 +342,6 @@ function formatFloat(v: number): string {
   return s;
 }
 
-function splitMapTypeExpr(typeExpr: string): { keyExpr: string; valueExpr: string } {
-  if (!typeExpr.startsWith('<') || !typeExpr.endsWith('>')) return { keyExpr: 'str', valueExpr: 'str' };
-  let depthAngle = 0;
-  let depthBrace = 0;
-  let depthBracket = 0;
-  for (let i = 1; i < typeExpr.length - 1; i++) {
-    const c = typeExpr[i]!;
-    if (c === '<') depthAngle++;
-    else if (c === '>') depthAngle--;
-    else if (c === '{') depthBrace++;
-    else if (c === '}') depthBrace--;
-    else if (c === '[') depthBracket++;
-    else if (c === ']') depthBracket--;
-    else if (c === ':' && depthAngle === 0 && depthBrace === 0 && depthBracket === 0) {
-      return {
-        keyExpr: typeExpr.slice(1, i).trim() || 'str',
-        valueExpr: typeExpr.slice(i + 1, -1).trim() || 'str'
-      };
-    }
-  }
-  return { keyExpr: 'str', valueExpr: 'str' };
-}
-
-function stripOptional(typeExpr: string): { inner: string; optional: boolean } {
-  return typeExpr.endsWith('?')
-    ? { inner: typeExpr.slice(0, -1), optional: true }
-    : { inner: typeExpr, optional: false };
-}
-
-function scanBalanced(src: string, pos: number, open: string, close: string): number {
-  let depth = 0;
-  while (pos < src.length) {
-    const c = src[pos]!;
-    if (c === open) depth++;
-    else if (c === close) {
-      depth--;
-      if (depth === 0) return pos + 1;
-    }
-    pos++;
-  }
-  return pos;
-}
-
-function scanTypeExpr(src: string, pos: number): { typeExpr: string; end: number } {
-  if (pos >= src.length) return { typeExpr: 'str', end: pos };
-  const c = src[pos]!;
-  if (c === '{') {
-    const end = scanBalanced(src, pos, '{', '}');
-    return { typeExpr: src.slice(pos, end), end };
-  }
-  if (c === '[') {
-    const end = scanBalanced(src, pos, '[', ']');
-    return { typeExpr: src.slice(pos, end), end };
-  }
-  if (c === '<') {
-    const end = scanBalanced(src, pos, '<', '>');
-    return { typeExpr: src.slice(pos, end), end };
-  }
-  const start = pos;
-  while (pos < src.length && src[pos] !== ',' && src[pos] !== '}' && src[pos] !== ' ' && src[pos] !== '\t') pos++;
-  return { typeExpr: src.slice(start, pos), end: pos };
-}
-
-function parseScalarToken(token: string): string | number | boolean | undefined {
-  if (token === 'true') return true;
-  if (token === 'false') return false;
-  let i = 0;
-  if (token[0] === '-') i = 1;
-  let seenDigit = false;
-  let seenDot = false;
-  for (; i < token.length; i++) {
-    const c = token.charCodeAt(i);
-    if (c >= 48 && c <= 57) {
-      seenDigit = true;
-      continue;
-    }
-    if (c === 46 && !seenDot) {
-      seenDot = true;
-      continue;
-    }
-    return undefined;
-  }
-  if (!seenDigit) return undefined;
-  return seenDot ? Number.parseFloat(token) : Number.parseInt(token, 10);
-}
-
 function encodeGenericValue(val: unknown): string {
   if (val === null || val === undefined) return '';
   if (typeof val === 'boolean') return val ? 'true' : 'false';
@@ -389,17 +349,20 @@ function encodeGenericValue(val: unknown): string {
   if (typeof val === 'bigint') return String(val);
   if (typeof val === 'string') return encodeStr(val);
   if (Array.isArray(val)) {
-    return '[' + val.map(item => encodeGenericValue(item)).join(', ') + ']';
+    return `[${val.map(item => encodeGenericValue(item)).join(', ')}]`;
   }
-  if (typeof val === 'object') {
-    return encodeByTypeExpr(val, inferValueTypeExpr(val), false);
+  if (isPlainObject(val)) {
+    return encodeByTypeExpr(val, inferValueTypeExpr(val));
   }
   return encodeStr(String(val));
 }
 
-function encodeByTypeExpr(val: unknown, typeExpr: string, optional: boolean): string {
-  if (optional && (val === null || val === undefined)) return '';
-  const { inner } = stripOptional(typeExpr);
+function encodeByTypeExpr(val: unknown, typeExpr: string, optional = false): string {
+  const stripped = stripOptional(typeExpr);
+  const inner = stripped.inner;
+  const isOptional = optional || stripped.optional;
+  if (isOptional && (val === null || val === undefined)) return '';
+
   switch (baseTypeFromExpr(inner)) {
     case 'bool':
       return val ? 'true' : 'false';
@@ -409,153 +372,97 @@ function encodeByTypeExpr(val: unknown, typeExpr: string, optional: boolean): st
     case 'float':
       return formatFloat(Number(val));
     case 'str':
-      return encodeStr(String(val));
+      return encodeStr(String(val ?? ''));
     case 'list': {
       const itemExpr = inner.slice(1, -1).trim() || 'str';
       const items = Array.isArray(val) ? val : [];
-      return '[' + items.map(item => encodeByTypeExpr(item, itemExpr, stripOptional(itemExpr).optional)).join(', ') + ']';
+      return `[${items.map(item => encodeByTypeExpr(item, itemExpr)).join(', ')}]`;
     }
     case 'struct': {
       const fields = parseSchema(inner).fields;
-      return encodeTuple(val as AsonObj, fields);
-    }
-    case 'map': {
-      const { valueExpr } = splitMapTypeExpr(inner);
-      const obj = (val as Record<string, unknown>) ?? {};
-      const parts: string[] = ['<'];
-      let first = true;
-      for (const k in obj) {
-        if (!first) parts.push(', ');
-        first = false;
-        parts.push(encodeStr(k), ': ');
-        const entry = obj[k];
-        if (entry === null || entry === undefined) {
-          parts.push('');
-          continue;
-        }
-        if (valueExpr === 'str' && (typeof entry !== 'string')) parts.push(encodeGenericValue(entry));
-        else parts.push(encodeByTypeExpr(entry, valueExpr, stripOptional(valueExpr).optional));
-      }
-      parts.push('>');
-      return parts.join('');
+      return encodeTuple((val as AsonObj) ?? {}, fields);
     }
   }
 }
-
-// ---------------------------------------------------------------------------
-// Encode a single value given its inferred type
-// ---------------------------------------------------------------------------
-
-function encodeValue(val: unknown, base: BaseType, optional: boolean): string {
-  return encodeByTypeExpr(val, base, optional);
-}
-
-// ---------------------------------------------------------------------------
-// Encode tuple (one row) using inferred fields
-// ---------------------------------------------------------------------------
 
 function encodeTuple(obj: AsonObj, fields: Field[]): string {
-  let s = '(';
+  let out = '(';
   for (let i = 0; i < fields.length; i++) {
-    if (i > 0) s += ',';
-    const f = fields[i]!;
-    s += encodeByTypeExpr(obj[f.name], f.typeExpr, f.optional);
+    if (i > 0) out += ',';
+    const field = fields[i]!;
+    out += encodeByTypeExpr(obj[field.name], field.typeExpr, field.optional);
   }
-  return s + ')';
+  return `${out})`;
 }
-
-// ---------------------------------------------------------------------------
-// encode(obj) → string   [untyped schema, inferred]
-// ---------------------------------------------------------------------------
 
 export function encode(obj: AsonResult): string {
   if (Array.isArray(obj)) {
     if (obj.length === 0) return '[{}]:\n';
     const fields = inferFields(obj[0]!);
-    const hdr = buildUntypedHeader(fields, true);
-    let out = hdr + ':\n';
+    const header = buildHeader(fields, true, false);
+    let out = `${header}:\n`;
     for (let i = 0; i < obj.length; i++) {
       out += encodeTuple(obj[i]!, fields);
       if (i < obj.length - 1) out += ',\n';
     }
-    out += '\n';
-    return out;
-  } else {
-    const fields = inferFields(obj as AsonObj);
-    const hdr = buildUntypedHeader(fields, false);
-    return hdr + ':\n' + encodeTuple(obj as AsonObj, fields) + '\n';
+    return `${out}\n`;
   }
-}
 
-// ---------------------------------------------------------------------------
-// encodeTyped(obj) → string  [typed schema, inferred]
-// ---------------------------------------------------------------------------
+  const fields = inferFields(obj);
+  const header = buildHeader(fields, false, false);
+  return `${header}:\n${encodeTuple(obj, fields)}\n`;
+}
 
 export function encodeTyped(obj: AsonResult): string {
   if (Array.isArray(obj)) {
     if (obj.length === 0) return '[{}]:\n';
     const fields = inferFields(obj[0]!);
-    const hdr = buildTypedHeader(fields, true);
-    let out = hdr + ':\n';
+    const header = buildHeader(fields, true, true);
+    let out = `${header}:\n`;
     for (let i = 0; i < obj.length; i++) {
       out += encodeTuple(obj[i]!, fields);
       if (i < obj.length - 1) out += ',\n';
     }
-    out += '\n';
-    return out;
-  } else {
-    const fields = inferFields(obj as AsonObj);
-    const hdr = buildTypedHeader(fields, false);
-    return hdr + ':\n' + encodeTuple(obj as AsonObj, fields) + '\n';
+    return `${out}\n`;
   }
-}
 
-// ---------------------------------------------------------------------------
-// encodePretty(obj) → string  [pretty + untyped schema]
-// ---------------------------------------------------------------------------
+  const fields = inferFields(obj);
+  const header = buildHeader(fields, false, true);
+  return `${header}:\n${encodeTuple(obj, fields)}\n`;
+}
 
 export function encodePretty(obj: AsonResult): string {
   return prettyFormat(encode(obj));
 }
 
-// ---------------------------------------------------------------------------
-// encodePrettyTyped(obj) → string  [pretty + typed schema]
-// ---------------------------------------------------------------------------
-
 export function encodePrettyTyped(obj: AsonResult): string {
   return prettyFormat(encodeTyped(obj));
 }
 
-// ---------------------------------------------------------------------------
-// Pretty formatter
-// ---------------------------------------------------------------------------
-
 const PRETTY_MAX_WIDTH = 100;
 
-function prettyFormat(src: string): string {
-  const match = buildMatchTable(src);
-  const f = new PrettyFmt(src, match);
-  f.writeTop();
-  return f.out;
-}
-
 function buildMatchTable(src: string): Int32Array {
-  const n = src.length;
-  const match = new Int32Array(n).fill(-1);
+  const match = new Int32Array(src.length).fill(-1);
   const stack: number[] = [];
   let inQuote = false;
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i]!;
     if (inQuote) {
-      if (src[i] === '\\') { i++; continue; }
-      if (src[i] === '"') inQuote = false;
+      if (c === '\\') {
+        i++;
+        continue;
+      }
+      if (c === '"') inQuote = false;
       continue;
     }
-    if (src[i] === '"') { inQuote = true; continue; }
-    if (src[i] === '(' || src[i] === '[' || src[i] === '{' || src[i] === '<') {
-      stack.push(i);
-    } else if (src[i] === ')' || src[i] === ']' || src[i] === '}' || src[i] === '>') {
-      if (stack.length > 0) {
-        const open = stack.pop()!;
+    if (c === '"') {
+      inQuote = true;
+      continue;
+    }
+    if (c === '(' || c === '[' || c === '{') stack.push(i);
+    else if (c === ')' || c === ']' || c === '}') {
+      const open = stack.pop();
+      if (open !== undefined) {
         match[open] = i;
         match[i] = open;
       }
@@ -564,50 +471,87 @@ function buildMatchTable(src: string): Int32Array {
   return match;
 }
 
-class PrettyFmt {
-  src: string; match: Int32Array; out = ''; pos = 0; depth = 0;
-  constructor(src: string, match: Int32Array) { this.src = src; this.match = match; }
+function prettyFormat(src: string): string {
+  const match = buildMatchTable(src);
+  const fmt = new PrettyFmt(src, match);
+  fmt.writeTop();
+  return fmt.out;
+}
 
-  indent(): string { return '  '.repeat(this.depth); }
+class PrettyFmt {
+  src: string;
+  match: Int32Array;
+  out = '';
+  pos = 0;
+  depth = 0;
+
+  constructor(src: string, match: Int32Array) {
+    this.src = src;
+    this.match = match;
+  }
+
+  indent(): string {
+    return '  '.repeat(this.depth);
+  }
 
   isSimple(start: number, end: number): boolean {
     return end - start <= PRETTY_MAX_WIDTH && !this.src.slice(start, end + 1).includes('\n');
   }
 
   writeTop(): void {
-    const src = this.src;
-    const n = src.length;
     let depth = 0;
-    let sepIdx = -1;
-    let inQ = false;
-    for (let i = 0; i < n; i++) {
-      const c = src[i];
-      if (inQ) { if (c === '\\') { i++; continue; } if (c === '"') inQ = false; continue; }
-      if (c === '"') { inQ = true; continue; }
-      if (c === '{' || c === '[' || c === '<') depth++;
-      else if (c === '}' || c === ']' || c === '>') depth--;
-      else if (c === ':' && depth === 0) { sepIdx = i; break; }
+    let inQuote = false;
+    let sep = -1;
+    for (let i = 0; i < this.src.length; i++) {
+      const c = this.src[i]!;
+      if (inQuote) {
+        if (c === '\\') {
+          i++;
+          continue;
+        }
+        if (c === '"') inQuote = false;
+        continue;
+      }
+      if (c === '"') {
+        inQuote = true;
+        continue;
+      }
+      if (c === '{' || c === '[') depth++;
+      else if (c === '}' || c === ']') depth--;
+      else if (c === ':' && depth === 0) {
+        sep = i;
+        break;
+      }
     }
-    if (sepIdx === -1) { this.out = src; return; }
-    this.out += src.slice(0, sepIdx + 1);
-    this.pos = sepIdx + 1;
+
+    if (sep === -1) {
+      this.out = this.src;
+      return;
+    }
+
+    this.out += this.src.slice(0, sep + 1);
+    this.pos = sep + 1;
     this.skipNewlines();
     this.out += '\n';
-    while (this.pos < n) {
+
+    while (this.pos < this.src.length) {
       this.skipWhitespaceAndCommas();
-      if (this.pos >= n) break;
-      if (src[this.pos] === '(') {
+      if (this.pos >= this.src.length) break;
+      if (this.src[this.pos] === '(') {
         const close = this.match[this.pos];
-        if (close === -1 || this.isSimple(this.pos, close)) {
-          while (this.pos <= close) this.out += src[this.pos++];
-        } else {
-          this.writeTuple();
+        if (close !== -1 && !this.isSimple(this.pos, close)) this.writeTuple();
+        else {
+          while (this.pos <= close) this.out += this.src[this.pos++]!;
         }
         this.skipWhitespace();
-        if (this.pos < n && src[this.pos] === ',') { this.out += ',\n'; this.pos++; }
-        else this.out += '\n';
+        if (this.pos < this.src.length && this.src[this.pos] === ',') {
+          this.out += ',\n';
+          this.pos++;
+        } else {
+          this.out += '\n';
+        }
       } else {
-        this.out += src[this.pos++];
+        this.out += this.src[this.pos++]!;
       }
     }
   }
@@ -619,44 +563,18 @@ class PrettyFmt {
     let first = true;
     while (this.pos < this.src.length && this.src[this.pos] !== ')') {
       this.skipWhitespace();
-      if (this.src[this.pos] === ',') { this.pos++; this.skipWhitespace(); continue; }
+      if (this.src[this.pos] === ',') {
+        this.pos++;
+        continue;
+      }
       if (!first) this.out += ',\n';
       first = false;
       this.out += this.indent();
       this.writeValue();
     }
     this.depth--;
-    this.out += '\n' + this.indent() + ')';
+    this.out += `\n${this.indent()})`;
     if (this.pos < this.src.length) this.pos++;
-  }
-
-  writeValue(): void {
-    const src = this.src;
-    if (this.pos >= src.length) return;
-    const c = src[this.pos];
-    if (c === '(' || c === '[' || c === '<') {
-      const close = this.match[this.pos];
-      if (close === -1 || this.isSimple(this.pos, close)) {
-        while (this.pos <= close) this.out += src[this.pos++];
-      } else {
-        if (c === '(') this.writeTuple();
-        else if (c === '[') this.writeList();
-        else this.writeMap();
-      }
-    } else if (c === '"') {
-      this.out += src[this.pos++];
-      while (this.pos < src.length) {
-        const ch = src[this.pos];
-        this.out += ch;
-        this.pos++;
-        if (ch === '\\') { this.out += src[this.pos++]; continue; }
-        if (ch === '"') break;
-      }
-    } else {
-      while (this.pos < src.length && src[this.pos] !== ',' && src[this.pos] !== ')' && src[this.pos] !== ']' && src[this.pos] !== '>') {
-        this.out += src[this.pos++];
-      }
-    }
   }
 
   writeList(): void {
@@ -666,81 +584,91 @@ class PrettyFmt {
     let first = true;
     while (this.pos < this.src.length && this.src[this.pos] !== ']') {
       this.skipWhitespace();
-      if (this.src[this.pos] === ',') { this.pos++; this.skipWhitespace(); continue; }
+      if (this.src[this.pos] === ',') {
+        this.pos++;
+        continue;
+      }
       if (!first) this.out += ',\n';
       first = false;
       this.out += this.indent();
       this.writeValue();
     }
     this.depth--;
-    this.out += '\n' + this.indent() + ']';
+    this.out += `\n${this.indent()}]`;
     if (this.pos < this.src.length) this.pos++;
   }
 
-  writeMap(): void {
-    this.out += '<\n';
-    this.pos++;
-    this.depth++;
-    let first = true;
-    while (this.pos < this.src.length && this.src[this.pos] !== '>') {
-      this.skipWhitespace();
-      if (this.src[this.pos] === ',') { this.pos++; this.skipWhitespace(); continue; }
-      if (!first) this.out += ',\n';
-      first = false;
-      this.out += this.indent();
-      while (this.pos < this.src.length && this.src[this.pos] !== ':') {
-        this.out += this.src[this.pos++];
+  writeValue(): void {
+    if (this.pos >= this.src.length) return;
+    const c = this.src[this.pos]!;
+    if (c === '(' || c === '[') {
+      const close = this.match[this.pos];
+      if (close !== -1 && !this.isSimple(this.pos, close)) {
+        if (c === '(') this.writeTuple();
+        else this.writeList();
+      } else {
+        while (this.pos <= close) this.out += this.src[this.pos++]!;
       }
-      if (this.pos < this.src.length && this.src[this.pos] === ':') {
-        this.out += ': ';
-        this.pos++;
-        this.skipWhitespace();
-      }
-      this.writeValue();
+      return;
     }
-    this.depth--;
-    this.out += '\n' + this.indent() + '>';
-    if (this.pos < this.src.length) this.pos++;
+    if (c === '"') {
+      this.out += this.src[this.pos++]!;
+      while (this.pos < this.src.length) {
+        const ch = this.src[this.pos]!;
+        this.out += ch;
+        this.pos++;
+        if (ch === '\\') {
+          this.out += this.src[this.pos++] ?? '';
+          continue;
+        }
+        if (ch === '"') break;
+      }
+      return;
+    }
+    while (this.pos < this.src.length && ![',', ')', ']'].includes(this.src[this.pos]!)) {
+      this.out += this.src[this.pos++]!;
+    }
   }
 
   skipWhitespace(): void {
-    while (this.pos < this.src.length && (this.src[this.pos] === ' ' || this.src[this.pos] === '\t' || this.src[this.pos] === '\n' || this.src[this.pos] === '\r')) this.pos++;
+    while (this.pos < this.src.length && [' ', '\t', '\n', '\r'].includes(this.src[this.pos]!)) this.pos++;
   }
+
   skipNewlines(): void {
-    while (this.pos < this.src.length && (this.src[this.pos] === '\n' || this.src[this.pos] === '\r')) this.pos++;
+    while (this.pos < this.src.length && ['\n', '\r'].includes(this.src[this.pos]!)) this.pos++;
   }
+
   skipWhitespaceAndCommas(): void {
-    while (this.pos < this.src.length) {
-      const c = this.src[this.pos];
-      if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === ',') this.pos++;
-      else break;
-    }
+    while (this.pos < this.src.length && [' ', '\t', '\n', '\r', ','].includes(this.src[this.pos]!)) this.pos++;
   }
 }
 
-// ---------------------------------------------------------------------------
-// decode(text) → AsonResult  [schema is embedded in the text]
-// ---------------------------------------------------------------------------
-
 export function decode(text: string): AsonResult {
-  const dec = new Decoder(text);
-  return dec.decodeTop();
+  return new Decoder(text).decodeTop();
 }
 
 class Decoder {
-  src: string; pos: number;
-  constructor(src: string) { this.src = src; this.pos = 0; }
+  src: string;
+  pos = 0;
 
-  err(msg: string): never { throw new AsonError(`${msg} at pos ${this.pos}`); }
+  constructor(src: string) {
+    this.src = src;
+  }
+
+  err(msg: string): never {
+    throw new AsonError(`${msg} at pos ${this.pos}`);
+  }
 
   skip(): void {
-    const s = this.src;
-    while (this.pos < s.length) {
-      const c = s[this.pos];
-      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { this.pos++; continue; }
-      if (c === '/' && this.pos + 1 < s.length && s[this.pos + 1] === '*') {
+    while (this.pos < this.src.length) {
+      const c = this.src[this.pos]!;
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
+        this.pos++;
+        continue;
+      }
+      if (c === '/' && this.src[this.pos + 1] === '*') {
         this.pos += 2;
-        while (this.pos + 1 < s.length && !(s[this.pos] === '*' && s[this.pos + 1] === '/')) this.pos++;
+        while (this.pos + 1 < this.src.length && !(this.src[this.pos] === '*' && this.src[this.pos + 1] === '/')) this.pos++;
         this.pos += 2;
         continue;
       }
@@ -750,144 +678,109 @@ class Decoder {
 
   decodeTop(): AsonResult {
     this.skip();
-    const s = this.src;
-    const isSlice = s[this.pos] === '[' && this.pos + 1 < s.length && s[this.pos + 1] === '{';
+    const isSlice = this.src[this.pos] === '[' && this.src[this.pos + 1] === '{';
+    if (isSlice) this.pos++;
 
-    if (isSlice) {
-      this.pos++; // skip '['
-    }
-
-    if (this.pos >= s.length || s[this.pos] !== '{') this.err('expected {');
-    const fields = this.parseSchemaFields();
+    if (this.src[this.pos] !== '{') this.err(`expected '{'`);
+    const { fields, end } = scanStructSchema(this.src, this.pos);
+    this.pos = end;
 
     this.skip();
     if (isSlice) {
-      if (this.pos >= s.length || s[this.pos] !== ']') this.err('expected ]');
+      if (this.src[this.pos] !== ']') this.err(`expected ']'`);
       this.pos++;
     }
+
     this.skip();
-    if (this.pos >= s.length || s[this.pos] !== ':') this.err('expected :');
+    if (this.src[this.pos] !== ':') this.err(`expected ':'`);
     this.pos++;
 
     if (isSlice) {
-      const results: AsonObj[] = [];
+      const rows: AsonObj[] = [];
       while (true) {
         this.skip();
-        if (this.pos >= s.length || s[this.pos] !== '(') break;
-        results.push(this.parseTuple(fields));
+        if (this.pos >= this.src.length || this.src[this.pos] !== '(') break;
+        rows.push(this.parseTuple(fields));
         this.skip();
-        if (this.pos < s.length && s[this.pos] === ',') { this.pos++; }
+        if (this.src[this.pos] === ',') this.pos++;
       }
-      return results;
-    } else {
       this.skip();
-      const obj = this.parseTuple(fields);
-      this.skip();
-      if (this.pos < s.length) this.err('trailing content after decoded value');
-      return obj;
+      if (this.pos < this.src.length) this.err(`trailing content after decoded value`);
+      return rows;
     }
-  }
 
-  parseSchemaFields(): Field[] {
-    const s = this.src;
-    if (s[this.pos] !== '{') this.err('expected {');
-    this.pos++;
-    const fields: Field[] = [];
-    while (this.pos < s.length) {
-      this.skip();
-      if (s[this.pos] === '}') { this.pos++; break; }
-      if (fields.length > 0) {
-        if (s[this.pos] !== ',') this.err('expected , in schema');
-        this.pos++;
-        this.skip();
-      }
-      const ns = this.pos;
-      while (this.pos < s.length && s[this.pos] !== ':' && s[this.pos] !== ',' && s[this.pos] !== '}' && s[this.pos] !== ' ' && s[this.pos] !== '\t') this.pos++;
-      const name = s.slice(ns, this.pos);
-      if (!name) this.err('empty field name');
-      this.skip();
-      let typePart: string = 'str';
-      if (this.pos < s.length && s[this.pos] === ':') {
-        this.pos++;
-        this.skip();
-        if (this.pos < s.length && (s[this.pos] === '{' || s[this.pos] === '[' || s[this.pos] === '<')) {
-          const scanned = scanTypeExpr(s, this.pos);
-          typePart = scanned.typeExpr;
-          this.pos = scanned.end;
-        } else {
-          const ts = this.pos;
-          while (this.pos < s.length && s[this.pos] !== ',' && s[this.pos] !== '}' && s[this.pos] !== ' ' && s[this.pos] !== '\t') this.pos++;
-          typePart = s.slice(ts, this.pos);
-        }
-      }
-      const optional = typePart.endsWith('?');
-      const basePart = optional ? typePart.slice(0, -1) : typePart;
-      const base = (basePart.startsWith('<') ? 'map' : basePart) as BaseType;
-      fields.push({ name, base, optional, typeExpr: basePart });
-    }
-    return fields;
-  }
-
-  parseTuple(fields: Field[]): AsonObj {
-    const s = this.src;
-    if (s[this.pos] !== '(') this.err('expected (');
-    this.pos++;
-    const obj: AsonObj = {};
-    for (let i = 0; i < fields.length; i++) {
-      this.skip();
-      if (this.pos >= s.length || s[this.pos] === ')') {
-        for (let j = i; j < fields.length; j++) {
-          if (fields[j]!.optional) obj[fields[j]!.name] = null;
-        }
-        break;
-      }
-      if (i > 0) {
-        if (s[this.pos] !== ',') this.err('expected ,');
-        this.pos++;
-        this.skip();
-      }
-      const f = fields[i]!;
-      if (f.optional && (this.pos >= s.length || s[this.pos] === ',' || s[this.pos] === ')')) {
-        obj[f.name] = null;
-        continue;
-      }
-      obj[f.name] = this.parseTypeExpr(f.typeExpr);
-    }
     this.skip();
-    if (this.pos < s.length && s[this.pos] === ')') this.pos++;
+    const obj = this.parseTuple(fields);
+    this.skip();
+    if (this.pos < this.src.length) this.err(`trailing content after decoded value`);
     return obj;
   }
 
-  parseTypeExpr(typeExpr: string): unknown {
-    this.skip();
-    const { inner, optional } = stripOptional(typeExpr);
-    if (optional && (this.pos >= this.src.length || this.src[this.pos] === ',' || this.src[this.pos] === ')' || this.src[this.pos] === ']' || this.src[this.pos] === '>')) {
-      return null;
+  parseTuple(fields: Field[]): AsonObj {
+    if (this.src[this.pos] !== '(') this.err(`expected '('`);
+    this.pos++;
+    const obj: AsonObj = {};
+
+    for (let i = 0; i < fields.length; i++) {
+      this.skip();
+      if (i > 0) {
+        if (this.src[this.pos] !== ',') this.err(`expected ','`);
+        this.pos++;
+        this.skip();
+      }
+      const field = fields[i]!;
+      if (this.src[this.pos] === ')' || this.src[this.pos] === ',' || this.pos >= this.src.length) {
+        obj[field.name] = null;
+        continue;
+      }
+      obj[field.name] = this.parseTypeExpr(field.typeExpr, field.optional);
     }
+
+    this.skip();
+    if (this.src[this.pos] !== ')') this.err(`expected ')'`);
+    this.pos++;
+    return obj;
+  }
+
+  parseTypeExpr(typeExpr: string, optional = false): unknown {
+    this.skip();
+    const stripped = stripOptional(typeExpr);
+    const inner = stripped.inner;
+    const isOptional = optional || stripped.optional;
+    if (this.pos >= this.src.length || [',', ')', ']'].includes(this.src[this.pos]!)) return null;
+
     switch (baseTypeFromExpr(inner)) {
-      case 'bool':  return this.parseBool();
-      case 'int':   return this.parseInt();
-      case 'uint':  return this.parseUint();
-      case 'float': return this.parseFloat();
-      case 'str':   return this.parseString();
-      case 'map':   return this.parseMap(inner);
-      case 'list':  return this.parseList(inner.slice(1, -1).trim() || 'str');
-      case 'struct': return this.parseTuple(parseSchema(inner).fields);
+      case 'bool':
+        return this.parseBool();
+      case 'int':
+        return this.parseInt();
+      case 'uint':
+        return this.parseUint();
+      case 'float':
+        return this.parseFloat();
+      case 'str': {
+        const value = this.parseString();
+        return value === '' && isOptional ? null : value;
+      }
+      case 'list': {
+        const itemExpr = inner.slice(1, -1).trim() || 'str';
+        return this.parseList(itemExpr);
+      }
+      case 'struct':
+        return this.parseTuple(parseSchema(inner).fields);
     }
   }
 
   parseGenericValue(): unknown {
     this.skip();
-    const s = this.src;
-    if (this.pos >= s.length || s[this.pos] === ',' || s[this.pos] === ')' || s[this.pos] === ']' || s[this.pos] === '>') return null;
-    const c = s[this.pos]!;
+    if (this.pos >= this.src.length || [',', ')', ']'].includes(this.src[this.pos]!)) return null;
+    const c = this.src[this.pos]!;
     if (c === '"') return this.parseQuotedString();
-    if (c === '<') return this.parseMap();
+    if (c === '<') this.err(`legacy map syntax '<...>' is not supported`);
     if (c === '[') return this.parseList();
     if (c === '(') return this.parseGenericTuple();
-    if (s.startsWith('true', this.pos)) return this.parseBool();
-    if (s.startsWith('false', this.pos)) return this.parseBool();
-    const token = this.parsePlainToken([',', ')', ']', '>']).trim();
+    if (this.src.startsWith('true', this.pos) || this.src.startsWith('false', this.pos)) return this.parseBool();
+    const token = this.parsePlainToken([',', ')', ']']).trim();
     if (token === '') return null;
     const scalar = parseScalarToken(token);
     if (scalar !== undefined) return scalar;
@@ -895,14 +788,13 @@ class Decoder {
   }
 
   parsePlainToken(terminators: string[]): string {
-    const s = this.src;
     const start = this.pos;
     let depthParen = 0;
     let depthBracket = 0;
-    let depthAngle = 0;
     let inQuote = false;
-    while (this.pos < s.length) {
-      const c = s[this.pos]!;
+
+    while (this.pos < this.src.length) {
+      const c = this.src[this.pos]!;
       if (inQuote) {
         if (c === '\\') {
           this.pos += 2;
@@ -925,188 +817,164 @@ class Decoder {
       else if (c === ']') {
         if (depthBracket === 0 && terminators.includes(c)) break;
         if (depthBracket > 0) depthBracket--;
-      } else if (c === '<') depthAngle++;
-      else if (c === '>') {
-        if (depthAngle === 0 && terminators.includes(c)) break;
-        if (depthAngle > 0) depthAngle--;
-      } else if (depthParen === 0 && depthBracket === 0 && depthAngle === 0 && terminators.includes(c)) {
+      } else if (depthParen === 0 && depthBracket === 0 && terminators.includes(c)) {
         break;
       }
       if (c === '\\') this.pos += 2;
       else this.pos++;
     }
-    return s.slice(start, this.pos);
+
+    return this.src.slice(start, this.pos);
   }
 
   parseGenericTuple(): unknown[] {
-    const s = this.src;
-    if (s[this.pos] !== '(') this.err('expected (');
+    if (this.src[this.pos] !== '(') this.err(`expected '('`);
     this.pos++;
     const out: unknown[] = [];
-    while (this.pos < s.length) {
+    while (this.pos < this.src.length) {
       this.skip();
-      if (s[this.pos] === ')') { this.pos++; break; }
+      if (this.src[this.pos] === ')') {
+        this.pos++;
+        break;
+      }
       out.push(this.parseGenericValue());
       this.skip();
-      if (this.pos < s.length && s[this.pos] === ',') this.pos++;
+      if (this.src[this.pos] === ',') this.pos++;
     }
     return out;
   }
 
   parseList(itemTypeExpr?: string): unknown[] {
-    const s = this.src;
-    if (s[this.pos] !== '[') this.err('expected [');
+    if (this.src[this.pos] !== '[') this.err(`expected '['`);
     this.pos++;
     const out: unknown[] = [];
-    while (this.pos < s.length) {
+    while (this.pos < this.src.length) {
       this.skip();
-      if (s[this.pos] === ']') { this.pos++; break; }
+      if (this.src[this.pos] === ']') {
+        this.pos++;
+        break;
+      }
       out.push(itemTypeExpr ? this.parseTypeExpr(itemTypeExpr) : this.parseGenericValue());
       this.skip();
-      if (this.pos < s.length && s[this.pos] === ',') this.pos++;
+      if (this.src[this.pos] === ',') this.pos++;
     }
     return out;
   }
 
-  parseMap(typeExpr?: string): AsonObj {
-    const s = this.src;
-    if (s[this.pos] !== '<') {
-       if (s[this.pos] === ',' || s[this.pos] === ')' || s[this.pos] === ']') return null as any; 
-       this.err('expected <');
-    }
-    this.pos++; // skip '<'
-    const obj: AsonObj = {};
-    const { valueExpr } = typeExpr ? splitMapTypeExpr(typeExpr) : { valueExpr: '' };
-    while (this.pos < s.length) {
-      this.skip();
-      if (s[this.pos] === '>') { this.pos++; break; }
-      
-      const start = this.pos;
-      let inQuote = s[this.pos] === '"';
-      let key = '';
-      if (inQuote) {
-          key = this.parseQuotedString();
-      } else {
-          while (this.pos < s.length && s[this.pos] !== ':' && s[this.pos] !== '>' && s[this.pos] !== ' ' && s[this.pos] !== '\t' && s[this.pos] !== '\n' && s[this.pos] !== '\r') {
-              if (s[this.pos] === '\\') this.pos += 2;
-              else this.pos++;
-          }
-          key = unescapePlain(s.slice(start, this.pos));
-      }
-      this.skip();
-      if (s[this.pos] !== ':') this.err('expected : in map');
-      this.pos++; // skip :
-      
-      this.skip();
-      if (this.pos >= s.length || s[this.pos] === ',' || s[this.pos] === '>') {
-          obj[key] = null;
-      } else {
-          obj[key] = valueExpr && valueExpr !== 'str'
-            ? this.parseTypeExpr(valueExpr)
-            : this.parseGenericValue();
-      }
-      
-      this.skip();
-      if (this.pos < s.length && s[this.pos] === ',') {
-          this.pos++;
-      }
-    }
-    return obj;
-  }
-
   parseBool(): boolean {
-    const s = this.src;
-    if (s.startsWith('true', this.pos)) { this.pos += 4; return true; }
-    if (s.startsWith('false', this.pos)) { this.pos += 5; return false; }
-    this.err('invalid bool');
+    if (this.src.startsWith('true', this.pos)) {
+      this.pos += 4;
+      return true;
+    }
+    if (this.src.startsWith('false', this.pos)) {
+      this.pos += 5;
+      return false;
+    }
+    this.err(`invalid bool`);
   }
 
-  parseInt(): number {
-    const s = this.src;
+  parseInt(): number | null {
+    if (this.pos >= this.src.length || [',', ')', ']'].includes(this.src[this.pos]!)) return null;
     let neg = false;
-    if (s[this.pos] === '-') { neg = true; this.pos++; }
+    if (this.src[this.pos] === '-') {
+      neg = true;
+      this.pos++;
+    }
     const start = this.pos;
     let v = 0;
-    while (this.pos < s.length) {
-      const c = s.charCodeAt(this.pos);
+    while (this.pos < this.src.length) {
+      const c = this.src.charCodeAt(this.pos);
       if (c < 48 || c > 57) break;
       v = v * 10 + (c - 48);
       this.pos++;
     }
-    if (this.pos === start) this.err('invalid int');
+    if (this.pos === start) this.err(`invalid int`);
     return neg ? -v : v;
   }
 
-  parseUint(): number {
-    const s = this.src;
+  parseUint(): number | null {
+    if (this.pos >= this.src.length || [',', ')', ']'].includes(this.src[this.pos]!)) return null;
     const start = this.pos;
     let v = 0;
-    while (this.pos < s.length) {
-      const c = s.charCodeAt(this.pos);
+    while (this.pos < this.src.length) {
+      const c = this.src.charCodeAt(this.pos);
       if (c < 48 || c > 57) break;
       v = v * 10 + (c - 48);
       this.pos++;
     }
-    if (this.pos === start) this.err('invalid uint');
+    if (this.pos === start) this.err(`invalid uint`);
     return v;
   }
 
-  parseFloat(): number {
-    const s = this.src;
+  parseFloat(): number | null {
+    if (this.pos >= this.src.length || [',', ')', ']'].includes(this.src[this.pos]!)) return null;
     const start = this.pos;
-    if (s[this.pos] === '-') this.pos++;
-    while (this.pos < s.length && s[this.pos] >= '0' && s[this.pos] <= '9') this.pos++;
-    if (this.pos < s.length && s[this.pos] === '.') {
+    if (this.src[this.pos] === '-') this.pos++;
+    while (this.pos < this.src.length && this.src[this.pos] >= '0' && this.src[this.pos] <= '9') this.pos++;
+    if (this.src[this.pos] === '.') {
       this.pos++;
-      while (this.pos < s.length && s[this.pos] >= '0' && s[this.pos] <= '9') this.pos++;
+      while (this.pos < this.src.length && this.src[this.pos] >= '0' && this.src[this.pos] <= '9') this.pos++;
     }
-    if (this.pos === start) this.err('invalid float');
-    return parseFloat(s.slice(start, this.pos));
+    if (this.pos === start) this.err(`invalid float`);
+    return Number.parseFloat(this.src.slice(start, this.pos));
   }
 
   parseString(): string {
-    const s = this.src;
-    if (s[this.pos] === '"') return this.parseQuotedString();
+    if (this.src[this.pos] === '"') return this.parseQuotedString();
     const start = this.pos;
-    while (this.pos < s.length && s[this.pos] !== ',' && s[this.pos] !== ')' && s[this.pos] !== ']') {
-      if (s[this.pos] === '\\') this.pos += 2;
+    while (this.pos < this.src.length && ![',', ')', ']'].includes(this.src[this.pos]!)) {
+      if (this.src[this.pos] === '\\') this.pos += 2;
       else this.pos++;
     }
-    const raw = s.slice(start, this.pos);
-    if (raw.includes('\\')) return unescapePlain(raw);
-    return raw;
+    const raw = this.src.slice(start, this.pos).trim();
+    if (raw === '') return '';
+    return raw.includes('\\') ? unescapePlain(raw) : raw;
   }
 
   parseQuotedString(): string {
     this.pos++;
-    const s = this.src;
-    const start = this.pos;
-    let scan = this.pos;
-    while (scan < s.length && s[scan] !== '"' && s[scan] !== '\\') scan++;
-    if (scan < s.length && s[scan] === '"') {
-      this.pos = scan + 1;
-      return s.slice(start, scan);
-    }
     const parts: string[] = [];
-    if (scan > start) parts.push(s.slice(start, scan));
-    this.pos = scan;
-    while (this.pos < s.length) {
-      const c = s[this.pos];
-      if (c === '"') { this.pos++; break; }
+    while (this.pos < this.src.length) {
+      const c = this.src[this.pos++]!;
+      if (c === '"') break;
       if (c === '\\') {
-        this.pos++;
-        const e = s[this.pos++];
-        if (e === 'n') parts.push('\n');
-        else if (e === 't') parts.push('\t');
-        else parts.push(e);
+        const esc = this.src[this.pos++]!;
+        if (esc === 'n') parts.push('\n');
+        else if (esc === 'r') parts.push('\r');
+        else if (esc === 't') parts.push('\t');
+        else if (esc === 'b') parts.push('\b');
+        else if (esc === 'f') parts.push('\f');
+        else parts.push(esc);
       } else {
-        const rs = this.pos;
-        while (this.pos < s.length && s[this.pos] !== '"' && s[this.pos] !== '\\') this.pos++;
-        parts.push(s.slice(rs, this.pos));
+        parts.push(c);
       }
     }
     return parts.join('');
   }
+}
+
+function parseScalarToken(token: string): string | number | boolean | undefined {
+  if (token === 'true') return true;
+  if (token === 'false') return false;
+
+  let i = 0;
+  if (token[0] === '-') i = 1;
+  let seenDigit = false;
+  let seenDot = false;
+  for (; i < token.length; i++) {
+    const c = token.charCodeAt(i);
+    if (c >= 48 && c <= 57) {
+      seenDigit = true;
+      continue;
+    }
+    if (c === 46 && !seenDot) {
+      seenDot = true;
+      continue;
+    }
+    return undefined;
+  }
+  if (!seenDigit) return undefined;
+  return seenDot ? Number.parseFloat(token) : Number.parseInt(token, 10);
 }
 
 function unescapePlain(s: string): string {
@@ -1114,205 +982,169 @@ function unescapePlain(s: string): string {
   for (let i = 0; i < s.length; i++) {
     if (s[i] === '\\') {
       i++;
-      if (s[i] === 'n') out += '\n';
-      else if (s[i] === 't') out += '\t';
-      else out += s[i];
-    } else out += s[i];
+      const c = s[i]!;
+      if (c === 'n') out += '\n';
+      else if (c === 'r') out += '\r';
+      else if (c === 't') out += '\t';
+      else if (c === 'b') out += '\b';
+      else if (c === 'f') out += '\f';
+      else out += c;
+    } else {
+      out += s[i]!;
+    }
   }
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// Binary encode/decode
-//
-// encodeBinary(obj)             — schema inferred internally, not exposed
-// decodeBinary(data, schema)    — schema string still required (binary has no embedded types)
-//
-// Wire format (LE):
-//   int   → 8 bytes i64
-//   uint  → 8 bytes u64
-//   float → 8 bytes f64
-//   bool  → 1 byte (0/1)
-//   str   → 4-byte length + UTF-8 bytes
-//   opt?  → 1-byte tag (0=null, 1=present) + value if present
-//   slice → 4-byte count + each element
-// ---------------------------------------------------------------------------
-
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
-
-const _f64Buf = new ArrayBuffer(8);
-const _f64View = new DataView(_f64Buf);
-const _f64Bytes = new Uint8Array(_f64Buf);
-
 class BinWriter {
   buf: Uint8Array;
-  len: number;
+  len = 0;
+
   constructor(cap: number) {
     this.buf = new Uint8Array(cap);
-    this.len = 0;
   }
+
   private grow(need: number): void {
     if (this.len + need <= this.buf.length) return;
-    let nc = this.buf.length;
-    while (nc < this.len + need) nc = nc * 2;
-    const nb = new Uint8Array(nc);
-    nb.set(this.buf.subarray(0, this.len));
-    this.buf = nb;
+    let next = Math.max(this.buf.length, 64);
+    while (next < this.len + need) next *= 2;
+    const out = new Uint8Array(next);
+    out.set(this.buf.subarray(0, this.len));
+    this.buf = out;
   }
-  push(b: number): void {
-    if (this.len >= this.buf.length) this.grow(1);
-    this.buf[this.len++] = b;
+
+  push(byte: number): void {
+    this.grow(1);
+    this.buf[this.len++] = byte;
   }
-  pushU32LE(v: number): void {
+
+  pushU32LE(value: number): void {
     this.grow(4);
-    this.buf[this.len++] = v & 0xFF;
-    this.buf[this.len++] = (v >> 8) & 0xFF;
-    this.buf[this.len++] = (v >> 16) & 0xFF;
-    this.buf[this.len++] = (v >> 24) & 0xFF;
+    this.buf[this.len++] = value & 0xff;
+    this.buf[this.len++] = (value >>> 8) & 0xff;
+    this.buf[this.len++] = (value >>> 16) & 0xff;
+    this.buf[this.len++] = (value >>> 24) & 0xff;
   }
-  pushI64LE(v: number | bigint): void {
+
+  pushI64LE(value: number | bigint): void {
     this.grow(8);
-    if (typeof v === 'number' && v >= -2147483648 && v <= 2147483647) {
-      const iv = v | 0;
-      this.buf[this.len++] = iv & 0xFF;
-      this.buf[this.len++] = (iv >> 8) & 0xFF;
-      this.buf[this.len++] = (iv >> 16) & 0xFF;
-      this.buf[this.len++] = (iv >> 24) & 0xFF;
-      const sign = iv < 0 ? 0xFF : 0;
-      this.buf[this.len++] = sign;
-      this.buf[this.len++] = sign;
-      this.buf[this.len++] = sign;
-      this.buf[this.len++] = sign;
-      return;
-    }
-    const big = typeof v === 'bigint' ? v : BigInt(Math.trunc(Number(v)));
-    const lo = Number(big & 0xFFFFFFFFn);
-    const hi = Number((big >> 32n) & 0xFFFFFFFFn);
-    this.buf[this.len++] = lo & 0xFF;
-    this.buf[this.len++] = (lo >> 8) & 0xFF;
-    this.buf[this.len++] = (lo >> 16) & 0xFF;
-    this.buf[this.len++] = (lo >> 24) & 0xFF;
-    this.buf[this.len++] = hi & 0xFF;
-    this.buf[this.len++] = (hi >> 8) & 0xFF;
-    this.buf[this.len++] = (hi >> 16) & 0xFF;
-    this.buf[this.len++] = (hi >> 24) & 0xFF;
+    const big = typeof value === 'bigint' ? value : BigInt(Math.trunc(Number(value)));
+    const lo = Number(big & 0xffffffffn);
+    const hi = Number((big >> 32n) & 0xffffffffn);
+    this.buf[this.len++] = lo & 0xff;
+    this.buf[this.len++] = (lo >>> 8) & 0xff;
+    this.buf[this.len++] = (lo >>> 16) & 0xff;
+    this.buf[this.len++] = (lo >>> 24) & 0xff;
+    this.buf[this.len++] = hi & 0xff;
+    this.buf[this.len++] = (hi >>> 8) & 0xff;
+    this.buf[this.len++] = (hi >>> 16) & 0xff;
+    this.buf[this.len++] = (hi >>> 24) & 0xff;
   }
-  pushF64LE(v: number): void {
+
+  pushF64LE(value: number): void {
     this.grow(8);
-    _f64View.setFloat64(0, v, true);
+    _f64View.setFloat64(0, value, true);
     this.buf.set(_f64Bytes, this.len);
     this.len += 8;
   }
+
   pushBytes(data: Uint8Array): void {
     this.grow(data.length);
     this.buf.set(data, this.len);
     this.len += data.length;
   }
+
   finish(): Uint8Array {
     return this.buf.slice(0, this.len);
   }
 }
 
-function writeBinByTypeExpr(w: BinWriter, val: unknown, typeExpr: string, optional = false): void {
+function writeBinByTypeExpr(writer: BinWriter, value: unknown, typeExpr: string, optional = false): void {
   const stripped = stripOptional(typeExpr);
   const inner = stripped.inner;
   const isOptional = optional || stripped.optional;
   if (isOptional) {
-    if (val === null || val === undefined) { w.push(0); return; }
-    w.push(1);
+    if (value === null || value === undefined) {
+      writer.push(0);
+      return;
+    }
+    writer.push(1);
   }
+
   switch (baseTypeFromExpr(inner)) {
     case 'bool':
-      w.push(val ? 1 : 0);
+      writer.push(value ? 1 : 0);
       break;
     case 'int':
-      w.pushI64LE(val as number | bigint);
-      break;
     case 'uint':
-      w.pushI64LE(val as number | bigint);
+      writer.pushI64LE(value as number | bigint);
       break;
     case 'float':
-      w.pushF64LE(Number(val));
+      writer.pushF64LE(Number(value));
       break;
     case 'str': {
-      const bytes = textEncoder.encode(String(val));
-      w.pushU32LE(bytes.length);
-      w.pushBytes(bytes);
+      const bytes = textEncoder.encode(String(value ?? ''));
+      writer.pushU32LE(bytes.length);
+      writer.pushBytes(bytes);
       break;
     }
     case 'list': {
       const itemExpr = inner.slice(1, -1).trim() || 'str';
-      const items = Array.isArray(val) ? val : [];
-      w.pushU32LE(items.length);
-      for (const item of items) writeBinByTypeExpr(w, item, itemExpr);
+      const items = Array.isArray(value) ? value : [];
+      writer.pushU32LE(items.length);
+      for (const item of items) writeBinByTypeExpr(writer, item, itemExpr);
       break;
     }
     case 'struct': {
       const fields = parseSchema(inner).fields;
-      const obj = (val as AsonObj) ?? {};
-      for (const f of fields) writeBinByTypeExpr(w, obj[f.name], f.typeExpr, f.optional);
-      break;
-    }
-    case 'map': {
-      const { valueExpr } = splitMapTypeExpr(inner);
-      const entries = Object.entries((val as Record<string, unknown>) ?? {});
-      w.pushU32LE(entries.length);
-      for (const [k, v] of entries) {
-        writeBinByTypeExpr(w, k, 'str');
-        writeBinByTypeExpr(w, v, valueExpr || 'str');
-      }
+      const obj = (value as AsonObj) ?? {};
+      for (const field of fields) writeBinByTypeExpr(writer, obj[field.name], field.typeExpr, field.optional);
       break;
     }
   }
 }
 
-/** encodeBinary(obj) — schema is inferred internally */
 export function encodeBinary(obj: AsonResult): Uint8Array {
   if (Array.isArray(obj)) {
     const fields = obj.length > 0 ? inferFields(obj[0]!) : [];
-    const w = new BinWriter(obj.length * fields.length * 16 + 16);
-    w.pushU32LE(obj.length);
+    const writer = new BinWriter(Math.max(64, obj.length * Math.max(fields.length, 1) * 16));
+    writer.pushU32LE(obj.length);
     for (const row of obj) {
-      for (const f of fields) writeBinByTypeExpr(w, row[f.name], f.typeExpr, f.optional);
+      for (const field of fields) writeBinByTypeExpr(writer, row[field.name], field.typeExpr, field.optional);
     }
-    return w.finish();
-  } else {
-    const o = obj as AsonObj;
-    const fields = inferFields(o);
-    const w = new BinWriter(fields.length * 16 + 16);
-    for (const f of fields) writeBinByTypeExpr(w, o[f.name], f.typeExpr, f.optional);
-    return w.finish();
+    return writer.finish();
   }
+
+  const fields = inferFields(obj);
+  const writer = new BinWriter(Math.max(64, fields.length * 16));
+  for (const field of fields) writeBinByTypeExpr(writer, obj[field.name], field.typeExpr, field.optional);
+  return writer.finish();
 }
 
-// ---------------------------------------------------------------------------
-// decodeBinary(data, schema) — schema must be explicit (binary has no types embedded)
-// ---------------------------------------------------------------------------
-
-function readI64LE(dv: DataView, pos: number): number {
-  const lo = dv.getUint32(pos, true);
-  const hi = dv.getInt32(pos + 4, true);
-  const big = (BigInt(hi) << 32n) | BigInt(lo);
-  return Number(big);
+function readI64LE(view: DataView, pos: number): number {
+  const lo = view.getUint32(pos, true);
+  const hi = view.getInt32(pos + 4, true);
+  return Number((BigInt(hi) << 32n) | BigInt(lo));
 }
 
-function readU64LE(dv: DataView, pos: number): number {
-  const lo = dv.getUint32(pos, true);
-  const hi = dv.getUint32(pos + 4, true);
-  const big = (BigInt(hi) << 32n) | BigInt(lo);
-  return Number(big);
+function readU64LE(view: DataView, pos: number): number {
+  const lo = view.getUint32(pos, true);
+  const hi = view.getUint32(pos + 4, true);
+  return Number((BigInt(hi) << 32n) | BigInt(lo));
 }
 
 class BinDecoder {
-  dv: DataView; pos: number;
-  constructor(data: Uint8Array) { this.dv = new DataView(data.buffer, data.byteOffset, data.byteLength); this.pos = 0; }
-  err(msg: string): never { throw new AsonError(`binary decode: ${msg} at byte ${this.pos}`); }
+  view: DataView;
+  pos = 0;
+
+  constructor(data: Uint8Array) {
+    this.view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  }
 
   readStruct(fields: Field[]): AsonObj {
-    const obj: AsonObj = {};
-    for (const f of fields) obj[f.name] = this.readByTypeExpr(f.typeExpr, f.optional);
-    return obj;
+    const out: AsonObj = {};
+    for (const field of fields) out[field.name] = this.readByTypeExpr(field.typeExpr, field.optional);
+    return out;
   }
 
   readByTypeExpr(typeExpr: string, optional = false): unknown {
@@ -1320,67 +1152,73 @@ class BinDecoder {
     const inner = stripped.inner;
     const isOptional = optional || stripped.optional;
     if (isOptional) {
-      const tag = this.dv.getUint8(this.pos++);
+      const tag = this.view.getUint8(this.pos++);
       if (tag === 0) return null;
     }
+
     switch (baseTypeFromExpr(inner)) {
-      case 'bool':  return this.dv.getUint8(this.pos++) !== 0;
-      case 'int':   { const v = readI64LE(this.dv, this.pos); this.pos += 8; return v; }
-      case 'uint':  { const v = readU64LE(this.dv, this.pos); this.pos += 8; return v; }
-      case 'float': { const v = this.dv.getFloat64(this.pos, true); this.pos += 8; return v; }
+      case 'bool':
+        return this.view.getUint8(this.pos++) !== 0;
+      case 'int': {
+        const value = readI64LE(this.view, this.pos);
+        this.pos += 8;
+        return value;
+      }
+      case 'uint': {
+        const value = readU64LE(this.view, this.pos);
+        this.pos += 8;
+        return value;
+      }
+      case 'float': {
+        const value = this.view.getFloat64(this.pos, true);
+        this.pos += 8;
+        return value;
+      }
       case 'str': {
-        const len = this.dv.getUint32(this.pos, true); this.pos += 4;
-        const bytes = new Uint8Array(this.dv.buffer, this.dv.byteOffset + this.pos, len);
+        const len = this.view.getUint32(this.pos, true);
+        this.pos += 4;
+        const bytes = new Uint8Array(this.view.buffer, this.view.byteOffset + this.pos, len);
         this.pos += len;
         return textDecoder.decode(bytes);
       }
       case 'list': {
-        const count = this.dv.getUint32(this.pos, true); this.pos += 4;
+        const count = this.view.getUint32(this.pos, true);
+        this.pos += 4;
         const itemExpr = inner.slice(1, -1).trim() || 'str';
         const out: unknown[] = [];
         for (let i = 0; i < count; i++) out.push(this.readByTypeExpr(itemExpr));
         return out;
       }
-      case 'struct': {
-        const fields = parseSchema(inner).fields;
-        return this.readStruct(fields);
-      }
-      case 'map': {
-        const count = this.dv.getUint32(this.pos, true); this.pos += 4;
-        const { valueExpr } = splitMapTypeExpr(inner);
-        const out: AsonObj = {};
-        for (let i = 0; i < count; i++) {
-          const key = this.readByTypeExpr('str') as string;
-          out[key] = this.readByTypeExpr(valueExpr || 'str');
-        }
-        return out;
-      }
+      case 'struct':
+        return this.readStruct(parseSchema(inner).fields);
     }
   }
 }
 
 export function decodeBinary(data: Uint8Array, schema: string): AsonResult {
   const { fields, isSlice } = parseSchema(schema);
-  const bd = new BinDecoder(data);
+  const decoder = new BinDecoder(data);
 
   let result: AsonResult;
   if (isSlice) {
-    const count = bd.dv.getUint32(bd.pos, true); bd.pos += 4;
+    const count = decoder.view.getUint32(decoder.pos, true);
+    decoder.pos += 4;
     const rows: AsonObj[] = [];
-    for (let i = 0; i < count; i++) rows.push(bd.readStruct(fields));
+    for (let i = 0; i < count; i++) rows.push(decoder.readStruct(fields));
     result = rows;
   } else {
-    result = bd.readStruct(fields);
+    result = decoder.readStruct(fields);
   }
 
-  if (bd.pos !== data.length) throw new AsonError(`binary decode: trailing bytes (read ${bd.pos}, total ${data.length})`);
+  if (decoder.pos !== data.length) {
+    throw new AsonError(`binary decode: trailing bytes (read ${decoder.pos}, total ${data.length})`);
+  }
   return result;
 }
 
-// ---------------------------------------------------------------------------
-// Error class
-// ---------------------------------------------------------------------------
-
 export class AsonError extends Error {
-  constructor(msg: string) { super(`ASON: ${msg}`); this.name = 'AsonError'; }
+  constructor(msg: string) {
+    super(`ASON: ${msg}`);
+    this.name = 'AsonError';
+  }
 }

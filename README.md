@@ -9,6 +9,8 @@ Zero-dependency JavaScript/TypeScript library for **ASON** (Array-Schema Object 
 
 Works in **browsers**, **Node.js**, **Deno**, **Bun** and any JS framework: **Vue**, **React**, **Svelte**, **SolidJS**, etc.
 
+Legacy `<k:v>` map syntax is no longer supported. Key-value collections should be modeled as entry lists such as `attrs@[{key@str,value@int}]`.
+
 [中文文档](README_CN.md)
 
 ---
@@ -22,7 +24,7 @@ JSON (100 tokens):
 {"users":[{"id":1,"name":"Alice","active":true},{"id":2,"name":"Bob","active":false}]}
 
 ASON (~35 tokens, 65% saved):
-[{id:int, name:str, active:bool}]:(1,Alice,true),(2,Bob,false)
+[{id@int, name@str, active@bool}]:(1,Alice,true),(2,Bob,false)
 ```
 
 | Aspect | JSON | ASON |
@@ -67,7 +69,7 @@ const blob        = encodeBinary(users);     // binary (schema inferred internal
 
 console.log(decode(textTyped));              // original array restored
 console.log(decode(prettyTyped));            // same from pretty
-console.log(decodeBinary(blob, '[{id:int, name:str, score:float}]')); // binary decode
+console.log(decodeBinary(blob, '[{id@int, name@str, score@float}]')); // binary decode
 ```
 
 > **Note on `encode` vs `encodeTyped`**
@@ -115,7 +117,17 @@ Same as `encode` but emits an **inferred typed** schema. Use this when you want 
 
 ```ts
 encodeTyped({ id: 1, name: 'Alice', active: true });
-// → '{id:int,name:str,active:bool}:\n(1,Alice,true)\n'
+// → '{id@int,name@str,active@bool}:\n(1,Alice,true)\n'
+```
+
+Nested object and array fields keep structural scaffolding even in untyped mode:
+
+```ts
+encode({
+  profile: { host: '127.0.0.1', port: 8080 },
+  tags: ['blue', 'fast'],
+});
+// → '{profile@{host,port},tags@[]}:\n((127.0.0.1,8080),[blue, fast])\n'
 ```
 
 ### `encodePretty(obj) → string`
@@ -131,8 +143,8 @@ Pretty-printed ASON text with **inferred typed** schema.
 Deserialize ASON text. The schema is embedded in the text itself:
 
 ```ts
-const rec  = decode('{id:int, name:str}:\n(1,Alice)\n');
-const rows = decode('[{id:int, name:str}]:\n(1,Alice),\n(2,Bob)\n');
+const rec  = decode('{id@int, name@str}:\n(1,Alice)\n');
+const rows = decode('[{id@int, name@str}]:\n(1,Alice),\n(2,Bob)\n');
 ```
 
 ### `encodeBinary(obj) → Uint8Array`
@@ -148,7 +160,7 @@ const data = encodeBinary(rows);
 Deserialize from binary format. **Schema is required** because the binary wire format carries no embedded type information:
 
 ```ts
-const rows = decodeBinary(data, '[{id:int, name:str}]');
+const rows = decodeBinary(data, '[{id@int, name@str}]');
 ```
 
 ---
@@ -226,7 +238,7 @@ Little-endian layout, byte-identical to ason-rs and ason-go:
 ```bash
 npm install
 npm run build    # generates dist/index.js, dist/index.cjs, dist/index.d.ts, dist/ason.min.js
-npm test         # vitest, 46 tests
+npm test         # vitest
 ```
 
 ---
@@ -235,7 +247,7 @@ npm test         # vitest, 46 tests
 
 ```bash
 node examples/basic.js     # 9 scenarios, basic usage
-node examples/complex.js   # 20 scenarios, edge cases
+node examples/complex.js   # complex nested scenarios and legacy-syntax rejection
 node examples/bench.js     # performance vs JSON.parse / JSON.stringify
 ```
 
