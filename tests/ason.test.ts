@@ -123,12 +123,12 @@ describe('string handling', () => {
     expect(decodeBinary(encodeBinary(obj), '{message@str}')).toEqual(obj);
   });
 
-  it('rejects schema type aliases', () => {
-    expect(() => decode('{id@integer,name@str}:(1,Alice)')).toThrow(AsonError);
-    expect(() => decode('{id@int,name@string}:(1,Alice)')).toThrow(AsonError);
-    expect(() => decode('{score@double}:(3.5)')).toThrow(AsonError);
-    expect(() => decode('{active@boolean}:(true)')).toThrow(AsonError);
-    expect(() => decode('{tags@[string]}:([Alice])')).toThrow(AsonError);
+  it('rejects invalid schema types', () => {
+    expect(() => decode('{id@numx,name@str}:(1,Alice)')).toThrow(AsonError);
+    expect(() => decode('{id@int,name@textx}:(1,Alice)')).toThrow(AsonError);
+    expect(() => decode('{score@decimalx}:(3.5)')).toThrow(AsonError);
+    expect(() => decode('{active@flagx}:(true)')).toThrow(AsonError);
+    expect(() => decode('{tags@[textx]}:([Alice])')).toThrow(AsonError);
   });
 });
 

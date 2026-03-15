@@ -85,10 +85,10 @@ console.log(decodeBinary(blob, '[{id@int, name@str, score@float}]')); // binary 
 
 | JS value | Inferred ASON type |
 |----------|--------------------|
-| integer `number` | `int` |
+| whole `number` | `int` |
 | fractional `number` | `float` |
-| `boolean` | `bool` |
-| `string` | `str` |
+| `true` / `false` | `bool` |
+| text | `str` |
 | `null` / `undefined` | `str?` (optional) |
 
 > **Note:** Schema is inferred from the **first element** of an array. To make a field optional (`str?`), ensure the first element has `null` for that field.
@@ -172,8 +172,8 @@ const rows = decodeBinary(data, '[{id@int, name@str}]');
 | `int` | number (integer) | `42`, `-100` |
 | `uint` | number (non-negative integer) | `0`, `9007199254740991` |
 | `float` | number | `3.14`, `-0.5` |
-| `bool` | boolean | `true`, `false` |
-| `str` | string | `Alice`, `"Carol Smith"` |
+| `bool` | `true` / `false` | `true`, `false` |
+| `str` | text | `Alice`, `"Carol Smith"` |
 | `T?` | value or `null` | `hello` / `null` |
 
 Optional fields: append `?` to any type (`str?`, `int?`, `float?`, `bool?`, `uint?`).
