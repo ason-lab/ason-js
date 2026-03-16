@@ -177,6 +177,10 @@ describe('binary roundtrip', () => {
 });
 
 describe('legacy syntax rejection', () => {
+  it('rejects multiple tuples after a single-row schema', () => {
+    expect(() => decode('{id@int,name@str}:(101,Alice),(102,Bob)')).toThrow(AsonError);
+  });
+
   it('rejects legacy colon type annotations', () => {
     expect(() => decode('{id:int}:\n(1)\n')).toThrow(AsonError);
   });
