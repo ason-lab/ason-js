@@ -1,6 +1,6 @@
 {
   "name": "ason-js",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "ASON (Array-Schema Object Notation) – high-performance, schema-driven data format for JS/TS",
   "license": "MIT",
   "type": "module",
