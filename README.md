@@ -61,10 +61,10 @@ const users = [
 ];
 
 // Schema is inferred automatically — no schema string needed
-const text        = encode(users);           // untyped schema
-const textTyped   = encodeTyped(users);      // typed  schema (use for typed round-trip)
+const text        = encode(users);           // schema without scalar hints
+const textTyped   = encodeTyped(users);      // schema with scalar hints (use for typed round-trip)
 const pretty      = encodePretty(users);     // pretty + untyped
-const prettyTyped = encodePrettyTyped(users);// pretty + typed
+const prettyTyped = encodePrettyTyped(users);// pretty + scalar hints
 const blob        = encodeBinary(users);     // binary (schema inferred internally)
 
 console.log(decode(textTyped));              // original array restored
@@ -73,9 +73,9 @@ console.log(decodeBinary(blob, '[{id@int, name@str, score@float}]')); // binary 
 ```
 
 > **Note on `encode` vs `encodeTyped`**
-> `encode(obj)` emits an *untyped* schema (`{id,name}`) so the output is shorter.
+> `encode(obj)` emits a schema without scalar hints (`{id,name}`) so the output is shorter.
 > When decoded, all values without explicit types are returned as strings.
-> Use `encodeTyped(obj)` when you need the round-trip to preserve numeric and boolean types.
+> Use `encodeTyped(obj)` when you need scalar hints to preserve numeric and boolean types on round-trip.
 
 ---
 
@@ -95,8 +95,8 @@ console.log(decodeBinary(blob, '[{id@int, name@str, score@float}]')); // binary 
 
 ### `encode(obj) → string`
 
-Serialize a plain object or array to ASON text with an **inferred untyped** schema.
-All values are written without type annotations. When decoded, all fields come back as **strings**:
+Serialize a plain object or array to ASON text with an **inferred schema without scalar hints**.
+When decoded, all scalar fields without explicit hints come back as **strings**:
 
 ```ts
 encode({ id: 1, name: 'Alice' });
@@ -106,21 +106,21 @@ encode([{ id: 1 }, { id: 2 }]);
 // → '[{id}]:\n(1),\n(2)\n'
 
 decode(encode({ id: 1, name: 'Alice' }));
-// → { id: '1', name: 'Alice' }  ← all strings when schema is untyped
+// → { id: '1', name: 'Alice' }  ← all strings when scalar hints are omitted
 ```
 
 Use `encodeTyped` when you need `decode` to restore the original types.
 
 ### `encodeTyped(obj) → string`
 
-Same as `encode` but emits an **inferred typed** schema. Use this when you want `decode()` to restore the original types:
+Same as `encode` but emits an **inferred schema with scalar hints**. Use this when you want `decode()` to restore the original scalar types:
 
 ```ts
 encodeTyped({ id: 1, name: 'Alice', active: true });
 // → '{id@int,name@str,active@bool}:\n(1,Alice,true)\n'
 ```
 
-Nested object and array fields keep structural scaffolding even in untyped mode:
+Nested object and array fields keep structural bindings even when scalar hints are omitted:
 
 ```ts
 encode({
